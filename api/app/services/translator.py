@@ -150,11 +150,17 @@ class TranslationService:
         if unknown_ids or (require_complete and returned_ids != expected_ids):
             raise RuntimeError("ID_MISMATCH: 模型返回的文字块 ID 与请求不一致")
 
-        normalized = {
-            segment_id: normalize_translation_text(translated[segment_id]).strip()
-            for segment_id in segments
-            if segment_id in translated
-        }
+        normalized = {}
+        for segment_id in segments:
+            if segment_id not in translated:
+                continue
+            translated_value = normalize_translation_text(
+                translated[segment_id]
+            ).strip()
+            if translated_value:
+                normalized[segment_id] = translated_value
+        if require_complete and set(normalized) != expected_ids:
+            raise RuntimeError("ID_MISMATCH: 模型返回的文字块译文为空")
         transliterated_residual_ids: List[str] = []
         if detected == "th":
             residual_ids = [
@@ -788,6 +794,8 @@ class OpenAIProvider(BaseProvider):
             "不要因为其他语言、数字或标点拆分原文；source_text 和 translated_text 都必须返回完整行。"
             "保留行内不属于源语言的英文、中文、数字、型号和标点；"
             "源语言文字必须翻译或以目标语言转写，不能原样遗漏。"
+            "公司名、品牌名、商标、人名、Logo 和型号默认保留原文；"
+            "整行只包含这类视觉标识时不要返回该文字块，避免覆盖原图。"
             "每个文字块必须返回其在图片中的矩形坐标 bbox，坐标顺序为 left, top, right, bottom，"
             "以图片左上角为原点并归一化到 0-1000。bbox 必须紧贴原文字形，不要扩展到整行、"
             "整列或整个单元格；每个视觉上连续的文字行单独返回，不要合并相距较远的文字块。"

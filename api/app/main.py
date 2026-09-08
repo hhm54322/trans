@@ -3427,6 +3427,24 @@ async def _translate_document_segment_batch(
             + source_context
         )
 
+    def can_split_after_failure(exc: RuntimeError) -> bool:
+        message = str(exc)
+        structural_failures = ("文字块", "完整返回", "ID_MISMATCH")
+        transient_gateway_failures = (
+            "模型服务请求失败 (500)",
+            "模型服务请求失败 (502)",
+            "模型服务请求失败 (503)",
+            "模型服务请求失败 (504)",
+            "模型服务请求失败 (520)",
+            "模型服务请求失败 (522)",
+            "模型服务请求失败 (524)",
+            "模型服务响应超时",
+        )
+        return any(
+            marker in message
+            for marker in (*structural_failures, *transient_gateway_failures)
+        )
+
     async def request_segments(request_batch, request_context=knowledge_context):
         try:
             async with semaphore:
@@ -3441,11 +3459,7 @@ async def _translate_document_segment_batch(
                     require_complete=False,
                 )
         except RuntimeError as exc:
-            if (
-                "文字块" not in str(exc)
-                and "完整返回" not in str(exc)
-                and "ID_MISMATCH" not in str(exc)
-            ):
+            if not can_split_after_failure(exc):
                 raise
             if len(request_batch) == 1:
                 segment = request_batch[0]
@@ -3510,11 +3524,7 @@ async def _translate_document_segment_batch(
                 True,
             )
         except RuntimeError as exc:
-            if (
-                "文字块" not in str(exc)
-                and "完整返回" not in str(exc)
-                and "ID_MISMATCH" not in str(exc)
-            ):
+            if not can_split_after_failure(exc):
                 raise
             retry = await request_segments(missing_segments, missing_context)
             return (
@@ -3536,7 +3546,8 @@ async def _translate_document_segment_batch(
     if used_split_retry:
         batch_warnings.insert(
             0,
-            "模型未完整返回文字块编号，已自动补发缺失内容以保持排版对应",
+            "模型请求超时或未完整返回文字块，"
+            "已自动拆分并补发以保持排版对应",
         )
     return batch_translations, batch_providers, batch_warnings
 
@@ -3594,12 +3605,16 @@ async def _translate_pdf_layout_pages(
 
     for start in range(0, len(page_numbers), concurrency):
         batch_numbers = page_numbers[start : start + concurrency]
-        tile_numbers = [
-            number
-            for number in batch_numbers
-            if (page_types or {}).get(number)
-            in {"image", "mixed", "vector", "vector_mixed"}
-        ]
+        tile_numbers = []
+        for number in batch_numbers:
+            page_type = (page_types or {}).get(number)
+            page_width, page_height = page_sizes.get(number, (0.0, 0.0))
+            large_scan = (
+                page_type in {"image", "mixed"}
+                and max(page_width, page_height) >= 1200.0
+            )
+            if page_type in {"vector", "vector_mixed"} or large_scan:
+                tile_numbers.append(number)
         full_numbers = [number for number in batch_numbers if number not in tile_numbers]
         rendered_pages = []
         if full_numbers:
@@ -3667,6 +3682,19 @@ async def _translate_pdf_layout_pages(
                 for block_index, block in enumerate(
                     page_result.layout_segments, start=1
                 ):
+                    source_value = re.sub(
+                        r"\s+", " ", str(block["source_text"]).strip()
+                    )
+                    translated_value = re.sub(
+                        r"\s+", " ", str(block["translated_text"]).strip()
+                    )
+                    # Proper names, brands, model codes and other deliberately
+                    # preserved text need no cover/write operation. Drawing an
+                    # identical visual block over a flattened logo makes it
+                    # darker or creates a duplicate even though no translation
+                    # was requested.
+                    if source_value == translated_value:
+                        continue
                     exact = database.find_exact_knowledge(
                         page_result.source_language,
                         target_language,

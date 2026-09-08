@@ -1271,7 +1271,12 @@ def test_scanned_pdf_route_never_calls_cad_candidate_detection(monkeypatch):
     content = make_pdf(["scan"], image_only=True)
     rendered = RenderedPdfPage(page_number=1, content=b"png")
 
-    monkeypatch.setattr(main_module, "render_pdf_tiles", lambda *_args: [rendered])
+    monkeypatch.setattr(main_module, "render_pdf_pages", lambda *_args: [rendered])
+    monkeypatch.setattr(
+        main_module,
+        "render_pdf_tiles",
+        lambda *_args: pytest.fail("slide-sized scan was unnecessarily tiled"),
+    )
     monkeypatch.setattr(main_module.translator, "provider", object())
     monkeypatch.setattr(
         main_module.database, "list_knowledge_for_direction", lambda *_args, **_kwargs: []
@@ -1292,6 +1297,11 @@ def test_scanned_pdf_route_never_calls_cad_candidate_detection(monkeypatch):
             provider="vision",
             warnings=[],
             layout_segments=[
+                {
+                    "source_text": "BLACK LOCUST",
+                    "translated_text": "BLACK LOCUST",
+                    "bbox": [20, 20, 800, 160],
+                },
                 {
                     "source_text": "รายการ",
                     "translated_text": "项目",
@@ -1318,6 +1328,7 @@ def test_scanned_pdf_route_never_calls_cad_candidate_detection(monkeypatch):
     )
 
     assert len(page_results) == 1
+    assert len(page_results[0][3]) == 1
     assert page_results[0][3][0]["translated_text"] == "项目"
 
 
@@ -1568,7 +1579,54 @@ def test_malformed_layout_batch_is_split_instead_of_retrying_every_block(monkeyp
 
     assert len(translations) == 8
     assert calls == [8, 4, 4, 2, 2, 2, 2]
-    assert any("自动补发缺失内容" in warning for warning in warnings)
+    assert any("已自动拆分并补发" in warning for warning in warnings)
+
+
+def test_gateway_timeout_layout_batch_is_split_and_completed(monkeypatch):
+    calls = []
+    segments = [
+        DocumentSegment(
+            segment_id=f"p1:b{index}",
+            page_number=1,
+            text=f"Block {index}",
+        )
+        for index in range(8)
+    ]
+
+    async def fake_translate_segments(
+        values, source_language, target_language, context, **_kwargs
+    ):
+        calls.append(len(values))
+        if len(values) > 2:
+            raise RuntimeError(
+                '模型服务请求失败 (524): {"error":{"message":"openai_error"}}'
+            )
+        return SegmentTranslationResult(
+            source_language="en",
+            translations={key: f"translated: {value}" for key, value in values.items()},
+            provider="fake",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(
+        main_module.database, "find_exact_knowledge_many", lambda *args: {}
+    )
+    monkeypatch.setattr(
+        main_module.database,
+        "find_matching_knowledge",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        main_module.translator, "translate_segments", fake_translate_segments
+    )
+
+    translations, _, warnings = asyncio.run(
+        main_module._translate_document_segments(segments, "en", "zh", "")
+    )
+
+    assert len(translations) == 8
+    assert calls == [8, 4, 4, 2, 2, 2, 2]
+    assert any("已自动拆分并补发" in warning for warning in warnings)
 
 
 def test_partial_layout_batch_retries_only_missing_ids_with_page_context(monkeypatch):
@@ -1621,7 +1679,7 @@ def test_partial_layout_batch_retries_only_missing_ids_with_page_context(monkeyp
     assert calls[1][0] == ["p1:b2", "p1:b3"]
     assert "同一页的完整原文" in calls[1][1]
     assert "[p1:b0] Block 0" in calls[1][1]
-    assert any("自动补发缺失内容" in warning for warning in warnings)
+    assert any("已自动拆分并补发" in warning for warning in warnings)
 
 
 def test_mixed_pdf_routes_image_page_through_visual_pipeline():
@@ -1984,6 +2042,24 @@ def test_segment_translation_sends_complete_mixed_line_without_placeholders():
 
     assert service.provider.translate_segments.await_args.args[0] == source
     assert result.translations == {"line-1": "ABC 建筑 123 / A-01"}
+
+
+def test_segment_translation_treats_empty_output_as_missing():
+    service = TranslationService(replace(settings, ai_provider="demo", openai_api_key=""))
+    service.provider = AsyncMock()
+    service.provider.translate_segments.return_value = (
+        {"line-1": "", "line-2": "已翻译"},
+        "test",
+    )
+    source = {"line-1": "Missing", "line-2": "Translated"}
+
+    partial = asyncio.run(
+        service.translate_segments(source, "en", "zh", require_complete=False)
+    )
+    assert partial.translations == {"line-2": "已翻译"}
+
+    with pytest.raises(RuntimeError, match="ID_MISMATCH.*译文为空"):
+        asyncio.run(service.translate_segments(source, "en", "zh"))
 
 
 def test_segment_translation_rejects_id_mismatch_and_romanizes_stubborn_residual():
