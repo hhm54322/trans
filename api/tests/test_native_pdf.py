@@ -7,9 +7,12 @@ from app.services.exports import build_adaptive_pdf_export
 
 from app.services.native_pdf import (
     NativePdfExtractor,
+    _annotate_native_table_cells,
     _circular_logo_line_indexes,
     _find_system_font,
     _map_raw_characters_to_content_tokens,
+    _merge_fragmented_raw_lines,
+    _merge_native_paragraph_units,
     _prepare_placement,
     build_native_pdf_export,
     prepare_native_pdf_source,
@@ -56,6 +59,176 @@ def _char_origins(content, characters):
         ]
     finally:
         document.close()
+
+
+def test_merges_adjacent_justified_fragments_on_the_same_baseline():
+    def fragment(text, left, right, baseline=100.0, size=12.0, color=0xFFFFFF):
+        character_width = (right - left) / len(text)
+        return {
+            "direction": (1.0, 0.0),
+            "entries": [
+                {
+                    "char": character,
+                    "bbox": (
+                        left + index * character_width,
+                        baseline - size,
+                        left + (index + 1) * character_width,
+                        baseline + 2.0,
+                    ),
+                    "origin": (left + index * character_width, baseline),
+                    "size": size,
+                    "color": color,
+                }
+                for index, character in enumerate(text)
+            ],
+        }
+
+    merged = _merge_fragmented_raw_lines(
+        [
+            fragment("including", 100.0, 155.0),
+            fragment("wealth", 172.0, 210.0),
+            fragment("management", 228.0, 300.0),
+            fragment("other column", 500.0, 590.0),
+        ]
+    )
+
+    assert len(merged) == 2
+    assert "".join(entry["char"] for entry in merged[0]["entries"]) == (
+        "including wealth management"
+    )
+    assert "".join(entry["char"] for entry in merged[1]["entries"]) == "other column"
+
+
+def _native_line_unit(text, bbox, origin, *, cell=None, color="#000000"):
+    metadata = {
+        "engine": "content-stream",
+        "direction": [1.0, 0.0],
+        "origin": list(origin),
+        "code_refs": [],
+        "available_width": bbox[2] - bbox[0],
+        "available_height": bbox[3] - bbox[1],
+    }
+    if cell is not None:
+        metadata["table_cell_bbox"] = list(cell)
+        metadata["layout_container"] = "table-cell"
+    return {
+        "segment_id": f"pdf:p1:{text}",
+        "page_number": 1,
+        "text": text,
+        "bbox": bbox,
+        "font_size": 12.0,
+        "color": color,
+        "metadata": metadata,
+    }
+
+
+def test_paragraph_merge_stays_inside_one_table_cell():
+    top_cell = (0.0, 0.0, 180.0, 60.0)
+    bottom_cell = (0.0, 60.0, 180.0, 120.0)
+    merged = _merge_native_paragraph_units(
+        [
+            _native_line_unit("First line", (10, 8, 100, 22), (10, 20), cell=top_cell),
+            _native_line_unit("second line", (10, 28, 105, 42), (10, 40), cell=top_cell),
+            _native_line_unit("next row", (10, 68, 90, 82), (10, 80), cell=bottom_cell),
+        ]
+    )
+
+    assert len(merged) == 2
+    assert merged[0]["text"] == "First line second line"
+    assert merged[0]["metadata"]["source_line_count"] == 2
+    assert merged[1]["text"] == "next row"
+
+
+def test_repeated_list_rows_remain_independent_layout_units():
+    merged = _merge_native_paragraph_units(
+        [
+            _native_line_unit("❖Client onboarding", (10, 8, 130, 22), (10, 20)),
+            _native_line_unit("❖Document submission", (10, 38, 150, 52), (10, 50)),
+            _native_line_unit("(1 Day)", (170, 8, 220, 22), (170, 20)),
+            _native_line_unit("(4 Day)", (170, 38, 220, 52), (170, 50)),
+        ]
+    )
+
+    assert [unit["text"] for unit in merged] == [
+        "❖Client onboarding",
+        "❖Document submission",
+        "(1 Day)",
+        "(4 Day)",
+    ]
+
+
+def test_bullet_continuation_merges_across_source_line_colors():
+    merged = _merge_native_paragraph_units(
+        [
+            _native_line_unit(
+                "❖Request corporate information for",
+                (10, 8, 250, 22),
+                (10, 20),
+                color="#c59c6c",
+            ),
+            _native_line_unit(
+                "bank due diligence requirements.",
+                (28, 28, 220, 42),
+                (28, 40),
+                color="#e0e0e0",
+            ),
+        ]
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["metadata"]["source_line_colors"] == ["#c59c6c", "#e0e0e0"]
+
+    font = fitz.Font(fontfile=str(_find_system_font("zh")))
+    merged[0]["translated_text"] = (
+        "❖在完成客户审查以及履行银行尽职调查要求时，按需提供完整公司资料。"
+    )
+    placement = _prepare_placement(merged[0], font)
+    assert placement["line_colors"][0] != placement["line_colors"][-1]
+
+
+def test_native_table_cell_sets_the_real_layout_container():
+    unit = _native_line_unit("Cell text", (10, 10, 70, 24), (10, 22))
+
+    annotated = _annotate_native_table_cells(
+        [unit], [(0, 0, 180, 60)], fitz.Rect(0, 0, 420, 300)
+    )
+
+    assert annotated[0]["metadata"]["layout_container"] == "table-cell"
+    assert annotated[0]["metadata"]["table_cell_bbox"] == [0.0, 0.0, 180.0, 60.0]
+    assert annotated[0]["metadata"]["available_width"] > unit["metadata"]["available_width"]
+
+
+def test_paragraph_keeps_source_size_until_the_container_overflows():
+    font = fitz.Font(fontfile=str(_find_system_font("zh")))
+    base = {
+        "segment_id": "pdf:p1:paragraph",
+        "page_number": 1,
+        "translated_text": "这是用于验证段落自动换行的中文译文",
+        "font_size": 12.0,
+        "color": "#000000",
+        "metadata": {
+            "origin": [10.0, 20.0],
+            "direction": [1.0, 0.0],
+            "available_width": 90.0,
+            "available_height": 80.0,
+            "source_line_count": 3,
+            "source_leading": 15.0,
+        },
+    }
+
+    roomy = _prepare_placement(base, font)
+    constrained = _prepare_placement(
+        {
+            **base,
+            "metadata": {**base["metadata"], "available_height": 25.0},
+        },
+        font,
+    )
+
+    assert roomy["font_size"] == pytest.approx(12.0)
+    assert len(roomy["lines"]) > 1
+    assert constrained["font_size"] < roomy["font_size"]
+    assert constrained["leading"] < roomy["leading"]
 
 
 def test_extracts_complete_mixed_line_with_content_stream_ids():

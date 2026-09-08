@@ -101,6 +101,11 @@ class NativePdfExtractor:
             for character in token.value
         ]
         raw_lines = _raw_page_lines(page)
+        try:
+            drawings = page.get_cdrawings()
+        except Exception:
+            drawings = page.get_drawings()
+        table_cells = _native_pdf_table_cells(page)
         effective_source_language = _resolve_page_source_language(
             raw_lines, self.source_language
         )
@@ -114,6 +119,8 @@ class NativePdfExtractor:
         mapping_reliable = _map_raw_characters_to_content_tokens(
             raw_characters, content_characters
         )
+        if mapping_reliable:
+            raw_lines = _merge_fragmented_raw_lines(raw_lines)
         units: List[Dict[str, Any]] = []
         skipped_directions = 0
         protected_logo_lines = _circular_logo_line_indexes(
@@ -146,11 +153,11 @@ class NativePdfExtractor:
                 units.extend(line_units)
                 skipped_directions += skipped
 
+        if mapping_reliable:
+            units = _annotate_native_table_cells(units, table_cells, page.rect)
+            units = _merge_native_paragraph_units(units)
+
         image_count = len(page.get_images(full=True))
-        try:
-            drawings = page.get_cdrawings()
-        except Exception:
-            drawings = page.get_drawings()
         drawing_count = len(drawings)
         vector_scan = drawing_count >= VECTOR_SCAN_DRAWING_THRESHOLD
         image_scan = image_count > 0 and not units
@@ -311,15 +318,20 @@ def build_native_pdf_export(
                 page = document[placement["page_number"] - 1]
                 origin = fitz.Point(placement["origin"])
                 shape = page_shapes.setdefault(placement["page_number"], page.new_shape())
-                shape.insert_text(
-                    origin,
-                    placement["text"],
-                    fontname="MetaTrans",
-                    fontfile=str(font_path),
-                    fontsize=placement["font_size"],
-                    color=placement["color"],
-                    morph=(origin, fitz.Matrix(placement["angle"])),
-                )
+                for line_index, text_line in enumerate(placement["lines"]):
+                    line_origin = fitz.Point(
+                        origin.x,
+                        origin.y + line_index * placement["leading"],
+                    )
+                    shape.insert_text(
+                        line_origin,
+                        text_line,
+                        fontname="MetaTrans",
+                        fontfile=str(font_path),
+                        fontsize=placement["font_size"],
+                        color=placement["line_colors"][line_index],
+                        morph=(line_origin, fitz.Matrix(placement["angle"])),
+                    )
             for shape in page_shapes.values():
                 shape.commit(overlay=True)
             # Rewriting already updates only referenced page streams. Deep
@@ -445,6 +457,94 @@ def _raw_page_lines(page):
     return raw_lines
 
 
+def _merge_fragmented_raw_lines(raw_lines: Sequence[Dict[str, Any]]):
+    """Join adjacent same-baseline text objects emitted by slide/PDF exporters."""
+
+    merged: List[Dict[str, Any]] = []
+    for source_line in raw_lines:
+        entries = list(source_line.get("entries") or [])
+        while entries and entries[0]["char"].isspace():
+            entries.pop(0)
+        while entries and entries[-1]["char"].isspace():
+            entries.pop()
+        line = {
+            **source_line,
+            "entries": entries,
+        }
+        if not merged or not _raw_line_fragments_can_merge(merged[-1], line):
+            merged.append(line)
+            continue
+        previous = merged[-1]
+        previous_entries = previous["entries"]
+        next_entries = line["entries"]
+        previous_rect = _union_rects(
+            fitz.Rect(entry["bbox"]) for entry in previous_entries
+        )
+        next_rect = _union_rects(
+            fitz.Rect(entry["bbox"]) for entry in next_entries
+        )
+        template = previous_entries[-1]
+        previous_entries.append(
+            {
+                "char": " ",
+                "bbox": (
+                    previous_rect.x1,
+                    min(previous_rect.y0, next_rect.y0),
+                    next_rect.x0,
+                    max(previous_rect.y1, next_rect.y1),
+                ),
+                "origin": (previous_rect.x1, template["origin"][1]),
+                "size": template["size"],
+                "color": template["color"],
+            }
+        )
+        previous_entries.extend(next_entries)
+    return merged
+
+
+def _raw_line_fragments_can_merge(first: Dict[str, Any], second: Dict[str, Any]) -> bool:
+    first_entries = list(first.get("entries") or [])
+    second_entries = list(second.get("entries") or [])
+    if not first_entries or not second_entries:
+        return False
+    first_direction = tuple(first.get("direction") or (1.0, 0.0))
+    second_direction = tuple(second.get("direction") or (1.0, 0.0))
+    if (
+        abs(float(first_direction[1])) > 0.05
+        or abs(float(second_direction[1])) > 0.05
+        or abs(float(first_direction[0]) - float(second_direction[0])) > 0.05
+    ):
+        return False
+    first_sizes = [float(entry["size"]) for entry in first_entries]
+    second_sizes = [float(entry["size"]) for entry in second_entries]
+    first_size = median(first_sizes)
+    second_size = median(second_sizes)
+    if abs(first_size - second_size) > max(0.75, min(first_size, second_size) * 0.12):
+        return False
+    first_colors = {
+        int(entry["color"]) & 0xFFFFFF
+        for entry in first_entries
+        if not entry["char"].isspace()
+    }
+    second_colors = {
+        int(entry["color"]) & 0xFFFFFF
+        for entry in second_entries
+        if not entry["char"].isspace()
+    }
+    if first_colors != second_colors:
+        return False
+    first_rect = _union_rects(fitz.Rect(entry["bbox"]) for entry in first_entries)
+    second_rect = _union_rects(fitz.Rect(entry["bbox"]) for entry in second_entries)
+    baseline_difference = abs(
+        median(float(entry["origin"][1]) for entry in first_entries)
+        - median(float(entry["origin"][1]) for entry in second_entries)
+    )
+    if baseline_difference > max(0.75, min(first_size, second_size) * 0.12):
+        return False
+    gap = second_rect.x0 - first_rect.x1
+    return -0.5 <= gap <= max(8.0, max(first_size, second_size) * 2.25)
+
+
 def _line_translation_units(
     line: Dict[str, Any], page_number: int, source_language: str
 ):
@@ -511,6 +611,253 @@ def _line_translation_units(
             },
         }
     ], 0
+
+
+def _merge_native_paragraph_units(units: Sequence[Dict[str, Any]]):
+    """Restore paragraphs that presentation exporters split into visual lines."""
+
+    paragraphs: List[List[Dict[str, Any]]] = []
+    for unit in units:
+        if (
+            paragraphs
+            and _native_units_belong_to_same_paragraph(paragraphs[-1][-1], unit)
+        ):
+            paragraphs[-1].append(unit)
+        else:
+            paragraphs.append([unit])
+
+    merged_units = []
+    for lines in paragraphs:
+        if len(lines) == 1:
+            merged_units.append(lines[0])
+            continue
+        first = lines[0]
+        line_rects = [fitz.Rect(line["bbox"]) for line in lines]
+        paragraph_rect = _union_rects(line_rects)
+        sizes = [float(line.get("font_size") or 11.0) for line in lines]
+        origins = [
+            tuple(float(value) for value in (line.get("metadata") or {})["origin"])
+            for line in lines
+        ]
+        leading_values = [
+            origins[index][1] - origins[index - 1][1]
+            for index in range(1, len(origins))
+            if origins[index][1] > origins[index - 1][1]
+        ]
+        metadata = dict(first.get("metadata") or {})
+        table_cell_bbox = metadata.get("table_cell_bbox")
+        if table_cell_bbox:
+            available_width = float(metadata.get("available_width") or paragraph_rect.width)
+            available_height = float(
+                metadata.get("available_height") or paragraph_rect.height
+            )
+        else:
+            available_width = paragraph_rect.width
+            available_height = paragraph_rect.height
+        metadata.update(
+            {
+                "code_refs": [
+                    reference
+                    for line in lines
+                    for reference in (line.get("metadata") or {}).get(
+                        "code_refs", []
+                    )
+                ],
+                "available_width": available_width,
+                "available_height": available_height,
+                "source_line_count": len(lines),
+                "source_line_colors": [
+                    str(line.get("color") or "#000000") for line in lines
+                ],
+                "source_leading": (
+                    median(leading_values)
+                    if leading_values
+                    else median(sizes) * 1.2
+                ),
+                "translation_unit": "complete-paragraph",
+            }
+        )
+        text = ""
+        for line in lines:
+            line_text = str(line.get("text") or "").strip()
+            separator = "" if text.endswith("-") else " "
+            text = f"{text}{separator}{line_text}".strip()
+        metadata["grapheme_count"] = _grapheme_count(text)
+        merged_units.append(
+            {
+                **first,
+                "text": text,
+                "bbox": tuple(paragraph_rect),
+                "font_size": median(sizes),
+                "metadata": metadata,
+            }
+        )
+    return merged_units
+
+
+def _native_units_belong_to_same_paragraph(
+    first: Dict[str, Any], second: Dict[str, Any]
+) -> bool:
+    first_metadata = first.get("metadata") or {}
+    second_metadata = second.get("metadata") or {}
+    first_cell = first_metadata.get("table_cell_bbox")
+    second_cell = second_metadata.get("table_cell_bbox")
+    if bool(first_cell) != bool(second_cell):
+        return False
+    if first_cell and tuple(first_cell) != tuple(second_cell):
+        return False
+    if _native_units_are_separate_list_items(first, second):
+        return False
+    if (
+        first_metadata.get("engine") != "content-stream"
+        or second_metadata.get("engine") != "content-stream"
+        or first.get("page_number") != second.get("page_number")
+    ):
+        return False
+    if (
+        first.get("color") != second.get("color")
+        and not _native_unit_is_bullet_continuation(first, second)
+    ):
+        return False
+    first_direction = tuple(first_metadata.get("direction") or (1.0, 0.0))
+    second_direction = tuple(second_metadata.get("direction") or (1.0, 0.0))
+    if (
+        abs(float(first_direction[1])) > 0.05
+        or abs(float(second_direction[1])) > 0.05
+        or abs(float(first_direction[0]) - float(second_direction[0])) > 0.05
+    ):
+        return False
+    first_size = float(first.get("font_size") or 11.0)
+    second_size = float(second.get("font_size") or 11.0)
+    if abs(first_size - second_size) > max(
+        0.75, min(first_size, second_size) * 0.12
+    ):
+        return False
+    first_rect = fitz.Rect(first["bbox"])
+    second_rect = fitz.Rect(second["bbox"])
+    if second_rect.y0 < first_rect.y0:
+        return False
+    vertical_gap = second_rect.y0 - first_rect.y1
+    if vertical_gap < -max(1.0, min(first_size, second_size) * 0.55):
+        return False
+    if vertical_gap > max(4.0, max(first_size, second_size) * 0.8):
+        return False
+    start_tolerance = max(8.0, max(first_size, second_size) * 2.0)
+    return abs(second_rect.x0 - first_rect.x0) <= start_tolerance
+
+
+def _native_units_are_separate_list_items(
+    first: Dict[str, Any], second: Dict[str, Any]
+) -> bool:
+    first_text = str(first.get("text") or "").lstrip()
+    second_text = str(second.get("text") or "").lstrip()
+    bullet_pattern = r"^[❖◆◇•●▪▫◊✓✔☑➢➤►]"
+    timed_step_pattern = r"^\(\s*\d+\s+[A-Za-z\u0E00-\u0E7F\u3400-\u9FFF]+\s*\)"
+    return bool(
+        (re.match(bullet_pattern, first_text) and re.match(bullet_pattern, second_text))
+        or (
+            re.match(timed_step_pattern, first_text)
+            and re.match(timed_step_pattern, second_text)
+        )
+    )
+
+
+def _native_unit_is_bullet_continuation(
+    first: Dict[str, Any], second: Dict[str, Any]
+) -> bool:
+    bullet_pattern = r"^[❖◆◇•●▪▫◊✓✔☑➢➤►]"
+    first_text = str(first.get("text") or "").lstrip()
+    second_text = str(second.get("text") or "").lstrip()
+    if not re.match(bullet_pattern, first_text) or re.match(
+        bullet_pattern, second_text
+    ):
+        return False
+    first_rect = fitz.Rect(first["bbox"])
+    second_rect = fitz.Rect(second["bbox"])
+    font_size = max(
+        float(first.get("font_size") or 11.0),
+        float(second.get("font_size") or 11.0),
+    )
+    indent = second_rect.x0 - first_rect.x0
+    return -1.0 <= indent <= font_size * 4.0
+
+
+def _annotate_native_table_cells(
+    units: Sequence[Dict[str, Any]], table_cells, page_rect: fitz.Rect
+):
+    """Constrain extractable text to its vector table cell when one exists."""
+
+    if not table_cells:
+        return list(units)
+    annotated = []
+    for source_unit in units:
+        unit = dict(source_unit)
+        rect = fitz.Rect(unit["bbox"])
+        center = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+        candidates = [
+            fitz.Rect(value)
+            for value in table_cells
+            if fitz.Rect(value).contains(center)
+        ]
+        cell = min(candidates, key=lambda value: value.get_area()) if candidates else None
+        if (
+            cell is None
+            or rect.x0 < cell.x0 - 2.0
+            or rect.x1 > cell.x1 + 2.0
+            or rect.y0 < cell.y0 - 2.0
+            or rect.y1 > cell.y1 + 2.0
+            or cell.height > max(rect.height * 8.0, page_rect.height * 0.15)
+            or cell.width > page_rect.width * 0.75
+        ):
+            annotated.append(unit)
+            continue
+        font_size = max(0.75, float(unit.get("font_size") or 11.0))
+        padding_x = max(1.0, min(4.0, font_size * 0.25))
+        padding_y = max(0.8, min(3.0, font_size * 0.18))
+        inner_right = cell.x1 - padding_x
+        inner_bottom = cell.y1 - padding_y
+        available_width = inner_right - rect.x0
+        available_height = inner_bottom - rect.y0
+        if available_width < 2.0 or available_height < font_size * 0.7:
+            annotated.append(unit)
+            continue
+        metadata = dict(unit.get("metadata") or {})
+        metadata.update(
+            {
+                "table_cell_bbox": [
+                    round(float(value), 3)
+                    for value in (cell.x0, cell.y0, cell.x1, cell.y1)
+                ],
+                "layout_container": "table-cell",
+                "available_width": available_width,
+                "available_height": available_height,
+            }
+        )
+        unit["metadata"] = metadata
+        annotated.append(unit)
+    return annotated
+
+
+def _native_pdf_table_cells(page):
+    """Return cells recognized by the PDF engine, excluding empty decoration."""
+
+    try:
+        finder = page.find_tables()
+    except Exception:
+        return []
+    cells = []
+    page_area = max(1.0, page.rect.get_area())
+    for table in finder.tables:
+        table_rect = fitz.Rect(table.bbox)
+        if table_rect.get_area() > page_area * 0.80:
+            continue
+        for value in table.cells:
+            if value is None:
+                continue
+            cell = fitz.Rect(value)
+            if cell.width >= 8.0 and cell.height >= 4.0:
+                cells.append(tuple(cell))
+    return cells
 
 
 def _line_text_layer_fallback_units(
@@ -919,8 +1266,28 @@ def _prepare_placement(segment: Dict[str, Any], font: fitz.Font):
         raise ValueError(f"RESIDUAL_SOURCE_TEXT: {segment.get('segment_id')}")
     original_size = max(0.75, float(segment.get("font_size") or 11.0))
     available_width = max(1.0, float(metadata.get("available_width") or 0.0))
-    target_width = max(0.001, font.text_length(translated, fontsize=original_size))
-    fitted_size = min(original_size, original_size * available_width / target_width)
+    source_line_count = max(1, int(metadata.get("source_line_count") or 1))
+    if source_line_count > 1 or metadata.get("layout_container"):
+        fitted_size, leading, lines = _fit_paragraph_text(
+            translated,
+            font,
+            original_size,
+            available_width,
+            max(1.0, float(metadata.get("available_height") or 0.0)),
+            max(
+                original_size,
+                float(metadata.get("source_leading") or original_size * 1.2),
+            ),
+        )
+    else:
+        target_width = max(
+            0.001, font.text_length(translated, fontsize=original_size)
+        )
+        fitted_size = min(
+            original_size, original_size * available_width / target_width
+        )
+        leading = fitted_size
+        lines = [translated]
     # A1/A0 CAD title blocks legitimately contain source text below 1.5 pt.
     # Keep a proportional readability floor for those labels while retaining
     # the existing 1.5 pt hard floor for ordinary document text.
@@ -933,15 +1300,124 @@ def _prepare_placement(segment: Dict[str, Any], font: fitz.Font):
     if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
         color = "#000000"
     rgb = tuple(int(color[index : index + 2], 16) / 255.0 for index in (1, 3, 5))
+    source_line_colors = metadata.get("source_line_colors") or [color]
+    parsed_line_colors = []
+    for source_color in source_line_colors:
+        source_color = str(source_color or "#000000")
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", source_color):
+            source_color = "#000000"
+        parsed_line_colors.append(
+            tuple(
+                int(source_color[index : index + 2], 16) / 255.0
+                for index in (1, 3, 5)
+            )
+        )
+    line_colors = [
+        parsed_line_colors[min(index, len(parsed_line_colors) - 1)]
+        for index in range(len(lines))
+    ]
     return {
         "page_number": int(segment["page_number"]),
         "segment_id": segment["segment_id"],
         "text": translated,
+        "lines": lines,
         "origin": tuple(float(value) for value in metadata["origin"]),
         "angle": angle,
         "font_size": fitted_size,
+        "leading": leading,
         "color": rgb,
+        "line_colors": line_colors,
     }
+
+
+def _fit_paragraph_text(
+    text: str,
+    font: fitz.Font,
+    original_size: float,
+    available_width: float,
+    available_height: float,
+    original_leading: float,
+):
+    minimum_size = max(0.75, min(1.5, original_size * 0.5))
+
+    def layout(font_size: float):
+        lines = _wrap_text_to_width(text, font, font_size, available_width)
+        scale = font_size / original_size
+        leading = max(font_size, original_leading * scale)
+        required_height = font_size + max(0, len(lines) - 1) * leading
+        return lines, leading, required_height
+
+    lines, leading, required_height = layout(original_size)
+    if required_height <= available_height + original_size * 0.25:
+        return original_size, leading, lines
+
+    low = minimum_size
+    high = original_size
+    best = None
+    for _ in range(16):
+        candidate = (low + high) / 2.0
+        candidate_lines, candidate_leading, candidate_height = layout(candidate)
+        if candidate_height <= available_height + candidate * 0.25:
+            best = (candidate, candidate_leading, candidate_lines)
+            low = candidate
+        else:
+            high = candidate
+    if best is None:
+        raise ValueError("LAYOUT_OVERFLOW: paragraph")
+    return best
+
+
+def _wrap_text_to_width(
+    text: str, font: fitz.Font, font_size: float, available_width: float
+) -> List[str]:
+    tokens = re.findall(
+        r"[A-Za-z0-9][A-Za-z0-9&./+_'\-]*|[\u3400-\u9FFF]|[^\s]",
+        text,
+    )
+    if not tokens:
+        return [text]
+    lines: List[str] = []
+    current = ""
+    for token in tokens:
+        separator = (
+            " "
+            if current
+            and current[-1].isascii()
+            and current[-1].isalnum()
+            and token[0].isascii()
+            and token[0].isalnum()
+            else ""
+        )
+        candidate = f"{current}{separator}{token}"
+        if not current and font.text_length(token, fontsize=font_size) > available_width:
+            token_parts = []
+            part = ""
+            for character in token:
+                candidate_part = f"{part}{character}"
+                if part and font.text_length(
+                    candidate_part, fontsize=font_size
+                ) > available_width:
+                    token_parts.append(part)
+                    part = character
+                else:
+                    part = candidate_part
+            if part:
+                token_parts.append(part)
+            if len(token_parts) > 1:
+                lines.extend(token_parts[:-1])
+                current = token_parts[-1]
+                continue
+        if (
+            current
+            and font.text_length(candidate, fontsize=font_size) > available_width
+        ):
+            lines.append(current)
+            current = token
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines or [text]
 
 
 def _validate_segments(segments: Sequence[Dict[str, Any]]) -> None:
@@ -983,8 +1459,16 @@ def _validate_written_pdf(
             source_page = source[page_number - 1]
             output_page = output[page_number - 1]
             output_text = output_page.get_text("text")
+            normalized_output_text = re.sub(r"\s+", " ", output_text).strip()
+            compact_output_text = re.sub(r"\s+", "", output_text)
             for segment in page_segments:
-                if _translation_text(segment) not in output_text:
+                translated = _translation_text(segment)
+                normalized_translation = re.sub(r"\s+", " ", translated).strip()
+                compact_translation = re.sub(r"\s+", "", translated)
+                if (
+                    normalized_translation not in normalized_output_text
+                    and compact_translation not in compact_output_text
+                ):
                     raise ValueError(f"ID_MISMATCH: {segment['segment_id']} was not written")
             source_language = str(
                 (page_segments[0].get("metadata") or {}).get("source_language")

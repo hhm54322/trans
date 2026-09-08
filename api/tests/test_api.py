@@ -13,6 +13,7 @@ import fitz
 import httpx
 import pytest
 from docx import Document
+from docx.shared import Pt
 from openpyxl import Workbook as ExcelWorkbook
 from openpyxl import load_workbook
 
@@ -832,7 +833,9 @@ def test_docx_export_uses_docx_and_contains_translation():
     document = Document()
     document.sections[0].top_margin = 720000
     document.sections[0].header.paragraphs[0].text = "Header text"
-    document.add_paragraph("Hello document")
+    paragraph = document.add_paragraph()
+    source_run = paragraph.add_run("Hello document")
+    source_run.font.size = Pt(18)
     table = document.add_table(rows=1, cols=2)
     table.cell(0, 0).text = "Name"
     table.cell(0, 1).text = "Value"
@@ -862,6 +865,12 @@ def test_docx_export_uses_docx_and_contains_translation():
     assert "演示译文" in "\n".join(
         paragraph.text for paragraph in translated_document.paragraphs
     )
+    translated_paragraph = next(
+        paragraph
+        for paragraph in translated_document.paragraphs
+        if "演示译文" in paragraph.text
+    )
+    assert translated_paragraph.runs[0].font.size.pt == pytest.approx(18.0)
     assert abs(translated_document.sections[0].top_margin - 720000) < 200
     assert "Header text" in translated_document.sections[0].header.paragraphs[0].text
     assert len(translated_document.tables) == 1
@@ -963,7 +972,7 @@ def test_pptx_export_replaces_text_in_place_and_enables_autofit():
         slide_xml = archive.read("ppt/slides/slide1.xml").decode("utf-8")
     assert "演示译文: Hello slide" in slide_xml
     assert "normAutofit" in slide_xml
-    assert 'sz="' in slide_xml
+    assert 'sz="2400"' in slide_xml
 
 
 def test_knowledge_csv_import_uses_thai_key_and_latest_value_wins():

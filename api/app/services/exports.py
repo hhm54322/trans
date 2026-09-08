@@ -1985,26 +1985,13 @@ def _replace_ooxml_paragraph_text(
     text_nodes = list(paragraph.iter(text_tag))
     if not text_nodes:
         return False
-    source_text = "".join(node.text or "" for node in text_nodes)
     text_nodes[0].text = translated_text
     for node in text_nodes[1:]:
         node.text = ""
-
-    source_length = max(1, len(source_text.strip()))
-    target_length = len(translated_text.strip())
-    if target_length <= source_length * 1.08:
-        return False
-    scale = max(0.65, min(1.0, (source_length / target_length) ** 0.5))
-    for size_node in paragraph.iter(size_tag):
-        raw_value = size_node.get(size_attribute)
-        if not raw_value:
-            continue
-        try:
-            current_size = int(raw_value)
-        except ValueError:
-            continue
-        minimum_size = int(5 * units_per_point)
-        size_node.set(size_attribute, str(max(minimum_size, round(current_size * scale))))
+    # Keep every source run property, including its exact font size. Word can
+    # naturally reflow paragraphs and table cells. PowerPoint callers enable
+    # normAutofit on the containing text body, which only applies a uniform
+    # scale when the translated paragraph actually exceeds the text box.
     return True
 
 
