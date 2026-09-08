@@ -155,6 +155,7 @@ class NativePdfExtractor:
 
         if mapping_reliable:
             units = _annotate_native_table_cells(units, table_cells, page.rect)
+            units = _annotate_native_vertical_lists(units)
             units = _merge_native_paragraph_units(units)
 
         image_count = len(page.get_images(full=True))
@@ -737,6 +738,13 @@ def _native_units_belong_to_same_paragraph(
     second_rect = fitz.Rect(second["bbox"])
     if second_rect.y0 < first_rect.y0:
         return False
+    first_origin = tuple(first_metadata.get("origin") or (first_rect.x0, first_rect.y1))
+    second_origin = tuple(
+        second_metadata.get("origin") or (second_rect.x0, second_rect.y1)
+    )
+    baseline_gap = float(second_origin[1]) - float(first_origin[1])
+    if baseline_gap > max(first_size, second_size) * 1.70:
+        return False
     vertical_gap = second_rect.y0 - first_rect.y1
     if vertical_gap < -max(1.0, min(first_size, second_size) * 0.55):
         return False
@@ -836,6 +844,85 @@ def _annotate_native_table_cells(
         unit["metadata"] = metadata
         annotated.append(unit)
     return annotated
+
+
+def _annotate_native_vertical_lists(units: Sequence[Dict[str, Any]]):
+    """Give widely spaced same-style list rows one shared text width."""
+
+    groups: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    for source_unit in units:
+        unit = dict(source_unit)
+        unit["metadata"] = dict(unit.get("metadata") or {})
+        if current and _native_units_form_vertical_list(current[-1], unit):
+            current.append(unit)
+        else:
+            if current:
+                groups.append(current)
+            current = [unit]
+    if current:
+        groups.append(current)
+
+    annotated = []
+    for group in groups:
+        if len(group) < 3:
+            annotated.extend(group)
+            continue
+        shared_width = max(
+            max(
+                fitz.Rect(unit["bbox"]).width,
+                float((unit.get("metadata") or {}).get("available_width") or 0.0),
+            )
+            for unit in group
+        )
+        for unit in group:
+            metadata = dict(unit.get("metadata") or {})
+            metadata["available_width"] = shared_width
+            metadata["layout_group"] = "vertical-list"
+            unit["metadata"] = metadata
+            annotated.append(unit)
+    return annotated
+
+
+def _native_units_form_vertical_list(
+    first: Dict[str, Any], second: Dict[str, Any]
+) -> bool:
+    first_metadata = first.get("metadata") or {}
+    second_metadata = second.get("metadata") or {}
+    if (
+        first.get("page_number") != second.get("page_number")
+        or first.get("color") != second.get("color")
+        or first_metadata.get("table_cell_bbox")
+        or second_metadata.get("table_cell_bbox")
+    ):
+        return False
+    first_direction = tuple(first_metadata.get("direction") or (1.0, 0.0))
+    second_direction = tuple(second_metadata.get("direction") or (1.0, 0.0))
+    if (
+        abs(float(first_direction[1])) > 0.05
+        or abs(float(second_direction[1])) > 0.05
+    ):
+        return False
+    first_size = float(first.get("font_size") or 11.0)
+    second_size = float(second.get("font_size") or 11.0)
+    if abs(first_size - second_size) > max(
+        0.75, min(first_size, second_size) * 0.12
+    ):
+        return False
+    first_rect = fitz.Rect(first["bbox"])
+    second_rect = fitz.Rect(second["bbox"])
+    if abs(second_rect.x0 - first_rect.x0) > max(first_size, second_size) * 0.5:
+        return False
+    first_origin = tuple(first_metadata.get("origin") or (first_rect.x0, first_rect.y1))
+    second_origin = tuple(
+        second_metadata.get("origin") or (second_rect.x0, second_rect.y1)
+    )
+    baseline_gap = float(second_origin[1]) - float(first_origin[1])
+    return (
+        max(first_size, second_size) * 1.70
+        < baseline_gap
+        <= max(first_size, second_size) * 3.50
+    )
 
 
 def _native_pdf_table_cells(page):

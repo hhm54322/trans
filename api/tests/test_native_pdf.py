@@ -8,6 +8,7 @@ from app.services.exports import build_adaptive_pdf_export
 from app.services.native_pdf import (
     NativePdfExtractor,
     _annotate_native_table_cells,
+    _annotate_native_vertical_lists,
     _circular_logo_line_indexes,
     _find_system_font,
     _map_raw_characters_to_content_tokens,
@@ -155,6 +156,31 @@ def test_repeated_list_rows_remain_independent_layout_units():
         "(1 Day)",
         "(4 Day)",
     ]
+
+
+def test_widely_spaced_text_rows_form_separate_equal_width_list_items():
+    units = [
+        _native_line_unit("ABOUT US", (100, 8, 160, 22), (100, 20)),
+        _native_line_unit("OUR TEAM", (100, 30, 170, 44), (100, 42)),
+        _native_line_unit("OUR SERVICES", (100, 52, 190, 66), (100, 64)),
+        _native_line_unit("TERMS & CONDITIONS", (100, 74, 220, 88), (100, 86)),
+    ]
+
+    annotated = _annotate_native_vertical_lists(units)
+    merged = _merge_native_paragraph_units(annotated)
+
+    assert [unit["text"] for unit in merged] == [
+        "ABOUT US",
+        "OUR TEAM",
+        "OUR SERVICES",
+        "TERMS & CONDITIONS",
+    ]
+    assert {
+        unit["metadata"]["available_width"] for unit in merged
+    } == {120.0}
+    assert all(
+        unit["metadata"]["layout_group"] == "vertical-list" for unit in merged
+    )
 
 
 def test_bullet_continuation_merges_across_source_line_colors():
