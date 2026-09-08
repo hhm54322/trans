@@ -159,8 +159,12 @@ def test_export_does_not_classify_or_validate_non_thai_content():
 @pytest.mark.parametrize(
     ("source_text", "source_language", "target_language", "translated_text"),
     [
+        ("建筑", "zh", "th", "อาคาร"),
+        ("建筑", "zh", "en", "Building"),
+        ("อาคาร", "th", "zh", "建筑"),
+        ("อาคาร", "th", "en", "Building"),
+        ("Building", "en", "zh", "建筑"),
         ("Project schedule", "en", "th", "กำหนดการโครงการ"),
-        ("项目进度", "zh", "en", "Project schedule"),
         ("Project schedule", "auto", "th", "กำหนดการโครงการ"),
     ],
 )

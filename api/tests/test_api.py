@@ -1234,6 +1234,7 @@ def test_scanned_pdf_enters_visual_translation_and_can_still_be_rendered():
 
     assert parsed.ocr_required is True
     assert parsed.page_types == ["image"]
+    assert parsed.page_profiles[0]["source_language"] == "auto"
     assert parsed.visual_pages == [1]
     assert parsed.page_count == 1
     assert parsed.text == ""
@@ -2767,6 +2768,16 @@ def test_pdf_pipeline_adds_uncovered_paddle_cad_text_to_translation(monkeypatch)
     assert recovered["metadata"]["ocr_provider"] == "paddle-full-page"
 
 
+async def _fake_two_stage_cad_text_translation(segments, *_args, **_kwargs):
+    return (
+        {
+            segment.segment_id: segment.text.replace("อาคาร", "建筑")
+            for segment in segments
+        },
+        ["text"],
+        [],
+    )
+
 
 def test_pdf_pipeline_reviews_only_unresolved_cad_candidates_at_high_resolution(
     monkeypatch,
@@ -2852,8 +2863,13 @@ def test_pdf_pipeline_reviews_only_unresolved_cad_candidates_at_high_resolution(
 
     monkeypatch.setattr(
         main_module.translator,
-        "translate_indexed_image_lines",
+        "read_indexed_image_lines",
         fake_translate_indexed,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
     )
 
     source_text, result = asyncio.run(
@@ -2938,8 +2954,13 @@ def test_pdf_pipeline_retries_timed_out_cad_high_resolution_review(monkeypatch):
 
     monkeypatch.setattr(
         main_module.translator,
-        "translate_indexed_image_lines",
+        "read_indexed_image_lines",
         fake_translate_indexed,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
     )
 
     source_text, result = asyncio.run(
@@ -3018,7 +3039,7 @@ def test_pdf_pipeline_fails_when_cad_review_still_omits_candidate_ids(monkeypatc
 
     monkeypatch.setattr(
         main_module.translator,
-        "translate_indexed_image_lines",
+        "read_indexed_image_lines",
         fake_translate_indexed,
     )
 
@@ -3115,7 +3136,7 @@ def test_pdf_pipeline_preserves_only_tiny_unreadable_cad_label(monkeypatch):
 
     monkeypatch.setattr(
         main_module.translator,
-        "translate_indexed_image_lines",
+        "read_indexed_image_lines",
         fake_translate_indexed,
     )
 
@@ -3195,7 +3216,7 @@ def test_pdf_pipeline_fast_mode_uses_local_cad_transcription(monkeypatch):
     assert result.layout_segments[0]["metadata"]["ocr_provider"] == "paddleocr"
 
 
-def test_pdf_pipeline_auto_mode_uses_tesseract_recall_without_full_page_paddle(
+def test_pdf_pipeline_auto_mode_uses_tesseract_primary_recall_with_paddle_audit(
     monkeypatch,
 ):
     content = make_pdf(["CAD"])
@@ -3227,6 +3248,11 @@ def test_pdf_pipeline_auto_mode_uses_tesseract_recall_without_full_page_paddle(
         "prepare_dense_cad_translation_sheets",
         fake_prepare,
     )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
 
     async def fake_translate_indexed(*_args, **_kwargs):
         return (
@@ -3242,8 +3268,13 @@ def test_pdf_pipeline_auto_mode_uses_tesseract_recall_without_full_page_paddle(
 
     monkeypatch.setattr(
         main_module.translator,
-        "translate_indexed_image_lines",
+        "read_indexed_image_lines",
         fake_translate_indexed,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
     )
 
     source_text, result = asyncio.run(
@@ -3254,7 +3285,7 @@ def test_pdf_pipeline_auto_mode_uses_tesseract_recall_without_full_page_paddle(
 
     assert source_text == "ABC อาคาร 123"
     assert result.layout_segments[0]["translated_text"] == "ABC 建筑 123"
-    assert result.layout_segments[0]["metadata"]["ocr_provider"] == "gpt-indexed-image"
+    assert result.layout_segments[0]["metadata"]["ocr_provider"] == "gpt-indexed-source"
     assert result.layout_segments[0]["font_size"] <= 16.0
 
 
@@ -3297,6 +3328,11 @@ def test_pdf_pipeline_native_cad_uses_indexed_outline_supplement_not_deep_ocr(
             and [{"content": b"png", "entries": {"ID001": candidate}}]
         ),
     )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
 
     async def fake_translate_indexed(*_args, **_kwargs):
         return (
@@ -3312,8 +3348,13 @@ def test_pdf_pipeline_native_cad_uses_indexed_outline_supplement_not_deep_ocr(
 
     monkeypatch.setattr(
         main_module.translator,
-        "translate_indexed_image_lines",
+        "read_indexed_image_lines",
         fake_translate_indexed,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
     )
 
     _source_text, result = asyncio.run(
@@ -3325,7 +3366,7 @@ def test_pdf_pipeline_native_cad_uses_indexed_outline_supplement_not_deep_ocr(
     assert result.layout_segments[0]["translated_text"] == "ABC 建筑 123"
 
 
-def test_pdf_pipeline_reliable_tesseract_line_uses_visual_translation(monkeypatch):
+def test_pdf_pipeline_reliable_tesseract_line_uses_two_stage_translation(monkeypatch):
     content = make_pdf(["CAD"])
     page = ParsedPdfPage(
         page_number=1,
@@ -3352,15 +3393,16 @@ def test_pdf_pipeline_reliable_tesseract_line_uses_visual_translation(monkeypatc
             {"content": b"png", "entries": {"ID001": candidate}}
         ],
     )
-
-    async def unexpected_text_translation(*_args, **_kwargs):
-        pytest.fail("CAD used the Tesseract transcription as translation input")
-
     monkeypatch.setattr(
         main_module,
-        "_translate_document_segments",
-        unexpected_text_translation,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
     )
+    translated_sources = []
+
+    async def fake_text_translation(segments, *_args, **_kwargs):
+        translated_sources.extend(segment.text for segment in segments)
+        return await _fake_two_stage_cad_text_translation(segments)
 
     async def fake_translate_indexed(*_args, **kwargs):
         assert kwargs["expected_sources"] == {"ID001": "ABC อาคาร 123"}
@@ -3377,8 +3419,13 @@ def test_pdf_pipeline_reliable_tesseract_line_uses_visual_translation(monkeypatc
 
     monkeypatch.setattr(
         main_module.translator,
-        "translate_indexed_image_lines",
+        "read_indexed_image_lines",
         fake_translate_indexed,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        fake_text_translation,
     )
 
     _source_text, result = asyncio.run(
@@ -3387,6 +3434,7 @@ def test_pdf_pipeline_reliable_tesseract_line_uses_visual_translation(monkeypatc
         )
     )
 
+    assert translated_sources == ["ABC อาคาร 123"]
     assert result.layout_segments[0]["translated_text"] == "ABC 建筑 123"
 
 

@@ -827,10 +827,12 @@ async def _translate_pdf_document_pipeline(
             page_plan = select_pdf_page_plan(
                 {"processing_route": processing_route}
             )
-            # The indexed CAD reader is Thai-specialized. Chinese and English
-            # pages use the generic visual layout reader instead of being
-            # forced through Thai OCR rules.
-            if visual_source_language in {"zh", "en"}:
+            # The indexed CAD reader is Thai-specialized. Chinese, English and
+            # pages without a native text layer use the generic visual layout
+            # reader instead of being forced through Thai OCR rules. For an
+            # automatic image/outline page, the vision response supplies the
+            # actual source language.
+            if visual_source_language in {"auto", "zh", "en"}:
                 return await _translate_pdf_layout_pages(
                     content,
                     [page_number],
@@ -944,7 +946,13 @@ async def _translate_pdf_document_pipeline(
                     for sheet in sheets
                     for unit in (sheet.get("supplemental_units") or [])
                 ]
-                async def read_indexed_sheet(sheet_number, sheet):
+                async def read_indexed_sheet(
+                    sheet_number,
+                    sheet,
+                    *,
+                    require_complete=True,
+                    stage="CAD 原文识别",
+                ):
                     sheet["sheet_number"] = sheet_number
                     expected_ids = list(sheet["entries"])
                     accepted_items = {}
@@ -952,7 +960,10 @@ async def _translate_pdf_document_pipeline(
                     pending_ids = list(expected_ids)
                     pending_sheet = sheet
                     last_error = None
-                    for attempt in range(CAD_INDEXED_MODEL_MAX_ATTEMPTS):
+                    maximum_attempts = (
+                        CAD_INDEXED_MODEL_MAX_ATTEMPTS if require_complete else 1
+                    )
+                    for attempt in range(maximum_attempts):
                         expected_sources = {
                             item_id: str(
                                 pending_sheet["entries"][item_id].get(
@@ -1002,21 +1013,35 @@ async def _translate_pdf_document_pipeline(
                             )
                         except (asyncio.TimeoutError, RuntimeError) as exc:
                             last_error = exc
-                        if attempt + 1 < CAD_INDEXED_MODEL_MAX_ATTEMPTS:
+                        if attempt + 1 < maximum_attempts:
                             # Retry exactly the unresolved source rows. Their
                             # pixels are copied from the initial high-density
                             # sheet, so this removes completed work without
                             # trading away any recognition detail.
-                            pending_sheet = await loop.run_in_executor(
-                                None,
-                                subset_indexed_translation_sheet,
-                                sheet,
-                                pending_ids,
-                            )
+                            pending_sheet = sheet
+                            if len(pending_ids) != len(expected_ids):
+                                pending_sheet = await loop.run_in_executor(
+                                    None,
+                                    subset_indexed_translation_sheet,
+                                    sheet,
+                                    pending_ids,
+                                )
                             if not pending_sheet.get("entries"):
                                 break
+                    sheet["unresolved_ids"] = list(pending_ids)
+                    if not require_complete:
+                        return (
+                            sheet,
+                            [
+                                accepted_items[item_id]
+                                for item_id in expected_ids
+                                if item_id in accepted_items
+                            ],
+                            "+".join(dict.fromkeys(routes)),
+                        )
                     raise RuntimeError(
-                        f"第 {page_number} 页 CAD 原文识别第 {sheet_number} 批失败："
+                        f"ID_MISMATCH: 第 {page_number} 页 {stage}第 "
+                        f"{sheet_number} 批失败："
                         f"{last_error}"
                     ) from last_error
 
@@ -1035,17 +1060,67 @@ async def _translate_pdf_document_pipeline(
 
                 source_results = await asyncio.gather(
                     *(
-                        read_indexed_sheet(sheet_number, sheet)
+                        read_indexed_sheet(
+                            sheet_number,
+                            sheet,
+                            require_complete=False,
+                        )
                         for sheet_number, sheet in enumerate(indexed_sheets, start=1)
                     )
                 )
                 recognized_rows = []
                 reader_providers = []
+                unresolved_for_review = []
+                preserved_tiny_label_candidates = 0
                 for sheet, items, route in source_results:
                     if route:
                         reader_providers.append(route)
                     for item in items:
                         recognized_rows.append((sheet["entries"][item["id"]], item))
+                    for item_id in sheet.get("unresolved_ids") or []:
+                        candidate = dict(sheet["entries"][item_id])
+                        if _cad_candidate_is_tiny_unreadable_label(candidate):
+                            preserved_tiny_label_candidates += 1
+                            continue
+                        candidate["origin_item_id"] = item_id
+                        unresolved_for_review.append(candidate)
+
+                if unresolved_for_review:
+                    def prepare_unresolved_review_sheets():
+                        document = fitz.open(stream=content, filetype="pdf")
+                        try:
+                            return prepare_dense_cad_review_sheets(
+                                document[page_number - 1],
+                                unresolved_for_review,
+                                desired_width=6400,
+                                rows_per_sheet=3,
+                            )
+                        finally:
+                            document.close()
+
+                    unresolved_sheets = await loop.run_in_executor(
+                        None, prepare_unresolved_review_sheets
+                    )
+                    unresolved_results = await asyncio.gather(
+                        *(
+                            read_indexed_sheet(
+                                sheet_number,
+                                sheet,
+                                stage="CAD 高清复核",
+                            )
+                            for sheet_number, sheet in enumerate(
+                                unresolved_sheets, start=1
+                            )
+                            if sheet.get("entries")
+                        )
+                    )
+                    for sheet, items, route in unresolved_results:
+                        if route:
+                            reader_providers.append(route)
+                        for item in items:
+                            recognized_rows.append(
+                                (sheet["entries"][item["id"]], item)
+                            )
 
                 raw_paddle_candidates = await paddle_supplement_task
                 paddle_candidates = filter_dense_cad_paddle_candidates(
@@ -1124,7 +1199,14 @@ async def _translate_pdf_document_pipeline(
                 if not translation_segments:
                     if progress_callback:
                         progress_callback(1, "正在检查页面视觉文字")
-                    return [], []
+                    empty_warnings = []
+                    if preserved_tiny_label_candidates:
+                        empty_warnings.append(
+                            f"第 {page_number} 页保留 "
+                            f"{preserved_tiny_label_candidates} 个"
+                            "多工具未确认的极小 CAD 标签原文"
+                        )
+                    return [], empty_warnings
 
                 text_translations, text_providers, text_warnings = (
                     await _translate_document_segments(
@@ -1196,6 +1278,12 @@ async def _translate_pdf_document_pipeline(
                     item["translated_text"] for item in page_layout
                 )
                 page_warnings = list(text_warnings)
+                if preserved_tiny_label_candidates:
+                    page_warnings.append(
+                        f"第 {page_number} 页保留 "
+                        f"{preserved_tiny_label_candidates} 个"
+                        "多工具未确认的极小 CAD 标签原文"
+                    )
                 repeated_source_count = len(recognized_rows) - len(unique_segments)
                 if repeated_source_count:
                     page_warnings.append(
@@ -3107,8 +3195,19 @@ def _build_layout_translation_result(
 
     source_text = _join_layout_pages(page_sources, document.page_count)
     translated_text = _join_layout_pages(page_translations, document.page_count)
+    # Page markers are Chinese UI structure (for example ``【第 1 页】``), not
+    # document content. Detect from the raw source blocks so a short English or
+    # Thai document is not mislabeled as Chinese merely because it has pages.
+    raw_source_text = "\n".join(
+        value
+        for page_number in sorted(page_sources)
+        for value in page_sources[page_number]
+        if value
+    )
     detected = (
-        detect_language(source_text) if source_language == "auto" else source_language
+        detect_language(raw_source_text)
+        if source_language == "auto"
+        else source_language
     )
     unique_providers = _unique_provider_names(providers) or ["knowledge-base"]
     warnings.insert(0, f"已按原文件结构翻译并写回 {len(layout_segments)} 个文字块")

@@ -1078,7 +1078,12 @@ def _resolve_page_source_language(raw_lines: Sequence[Dict[str, Any]], requested
         )
         for language in ("th", "zh", "en")
     }
-    return max(counts, key=counts.get)
+    detected = max(counts, key=counts.get)
+    # Image-only and outline-text pages have no usable native characters.
+    # Keep them as automatic instead of arbitrarily choosing the first
+    # language (historically Thai), so the visual reader can identify Chinese,
+    # Thai or English from the rendered page itself.
+    return detected if counts[detected] else "auto"
 
 
 def _grapheme_count(value: str) -> int:
