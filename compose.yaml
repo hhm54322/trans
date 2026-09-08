@@ -1,0 +1,42 @@
+name: siamlink
+
+services:
+  siamlink:
+    build: .
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    environment:
+      APP_ENV: production
+      APP_MAX_UPLOAD_MB: ${APP_MAX_UPLOAD_MB:-200}
+      APP_MAX_DOCUMENT_CHARACTERS: ${APP_MAX_DOCUMENT_CHARACTERS:-1000000}
+      APP_UPLOAD_SOURCE_DIRECTORY: ${APP_UPLOAD_SOURCE_DIRECTORY:-/app/data/uploads}
+      APP_DOCUMENT_LOG_PATH: ${APP_DOCUMENT_LOG_PATH:-/app/data/logs/document-jobs.log}
+      AI_PROVIDER: ${AI_PROVIDER:-demo}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-terra}
+      OPENAI_VISION_MODEL: ${OPENAI_VISION_MODEL:-gpt-5.6-terra}
+      OPENAI_API_MODE: ${OPENAI_API_MODE:-auto}
+      OPENAI_REASONING_EFFORT: ${OPENAI_REASONING_EFFORT:-none}
+      OPENAI_MAX_CONCURRENCY: ${OPENAI_MAX_CONCURRENCY:-5}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES:-3}
+      OPENAI_RETRY_BASE_SECONDS: ${OPENAI_RETRY_BASE_SECONDS:-1.0}
+      APP_PDF_OCR_MAX_PAGES: ${APP_PDF_OCR_MAX_PAGES:-50}
+      APP_PDF_OCR_DESIRED_WIDTH: ${APP_PDF_OCR_DESIRED_WIDTH:-1600}
+      APP_PDF_OCR_CONCURRENCY: ${APP_PDF_OCR_CONCURRENCY:-1}
+    volumes:
+      - siamlink-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).read()"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  siamlink-data:

@@ -1,0 +1,9 @@
+ARG RUNTIME_BASE=siamlink-siamlink:final-20260907
+
+FROM ${RUNTIME_BASE}
+
+WORKDIR /app
+COPY api/ ./api/
+COPY web/dist/ ./web/dist/
+
+CMD ["uvicorn", "api.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,1 @@
+30 3 * * * root /opt/siamlink/deploy/metatrans-certbot-renew.sh >> /var/log/metatrans-certbot-renew.log 2>&1

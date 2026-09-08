@@ -1,0 +1,20 @@
+fastapi==0.115.14
+uvicorn==0.30.6
+httpx==0.27.2
+python-multipart==0.0.20
+pypdf==5.1.0
+PyMuPDF==1.24.11
+pikepdf==9.2.1
+python-docx==1.1.2
+openpyxl==3.1.5
+reportlab==4.2.5
+opencv-python-headless==4.8.1.78
+pytest==8.3.5
+paddleocr==3.7.0
+paddlepaddle>=3.0,<4
+fonttools>=4.55,<5
+# Native PDF grapheme segmentation. The engine has a conservative fallback
+# so an existing environment can still start before this wheel is installed.
+regex>=2024.11,<2027
+# Official Alibaba Cloud SDK for the isolated Thai OCR benchmark.
+alibabacloud_ocr_api20210707==3.1.3
