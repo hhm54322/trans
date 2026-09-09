@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -61,6 +61,10 @@ class TranslationService:
             self.provider: BaseProvider = OpenAIProvider(settings)
         else:
             self.provider = DemoProvider()
+
+    async def aclose(self) -> None:
+        """Release provider resources owned by the current server loop."""
+        await self.provider.aclose()
 
     async def translate(
         self,
@@ -616,9 +620,54 @@ class TranslationService:
             if item_id in by_id
         ], route
 
+    async def read_indexed_image_line_group(
+        self,
+        contents: Sequence[bytes],
+        media_type: str,
+        expected_ids: List[str],
+        context: str = "",
+        *,
+        expected_sources: Optional[Dict[str, str]] = None,
+        require_complete: bool = True,
+    ) -> Tuple[List[Dict[str, str]], str]:
+        """Read several unchanged indexed sheets in one model request."""
+        expected_order = list(dict.fromkeys(expected_ids))
+        expected = set(expected_order)
+        items, route = await self.provider.read_indexed_image_line_group(
+            contents,
+            media_type,
+            context.strip(),
+            expected_sources=expected_sources,
+        )
+        by_id: Dict[str, Dict[str, str]] = {}
+        for item in items:
+            item_id = str(item.get("id") or "").strip()
+            source_text = str(item.get("source_text") or "").strip()
+            if not item_id or not source_text or item_id in by_id:
+                raise RuntimeError("ID_MISMATCH: CAD 多图索引返回了空白或重复 ID")
+            by_id[item_id] = {"id": item_id, "source_text": source_text}
+        unknown = set(by_id) - expected
+        missing = [item_id for item_id in expected_order if item_id not in by_id]
+        if unknown or (require_complete and missing):
+            unknown_preview = ", ".join(sorted(unknown)[:4])
+            missing_preview = ", ".join(missing[:4])
+            raise RuntimeError(
+                "ID_MISMATCH: CAD 多图索引原文识别不完整"
+                + (f"，缺少 {missing_preview}" if missing_preview else "")
+                + (f"，多出 {unknown_preview}" if unknown_preview else "")
+            )
+        return [
+            by_id[item_id]
+            for item_id in expected_order
+            if item_id in by_id
+        ], route
+
 
 class BaseProvider:
     name = "base"
+
+    async def aclose(self) -> None:
+        return None
 
     async def translate(
         self,
@@ -680,6 +729,16 @@ class BaseProvider:
     ) -> Tuple[List[Dict[str, str]], str]:
         raise NotImplementedError
 
+    async def read_indexed_image_line_group(
+        self,
+        contents: Sequence[bytes],
+        media_type: str,
+        context: str,
+        *,
+        expected_sources: Optional[Dict[str, str]] = None,
+    ) -> Tuple[List[Dict[str, str]], str]:
+        raise NotImplementedError
+
 
 class OpenAIProvider(BaseProvider):
     name = "openai"
@@ -690,6 +749,10 @@ class OpenAIProvider(BaseProvider):
         # Tests and local workers may create more than one event loop. Keep a
         # semaphore per loop so an asyncio primitive is never reused across loops.
         self._semaphores_by_loop: Dict[int, asyncio.Semaphore] = {}
+        # Reuse TCP/TLS connections during one document job. A client is tied
+        # to the event loop that opened its sockets, so keep the same per-loop
+        # boundary as the request semaphore instead of sharing one globally.
+        self._clients_by_loop: Dict[int, httpx.AsyncClient] = {}
 
     async def translate(
         self,
@@ -918,6 +981,52 @@ class OpenAIProvider(BaseProvider):
         )
         return parse_indexed_image_sources(text), route
 
+    async def read_indexed_image_line_group(
+        self,
+        contents: Sequence[bytes],
+        media_type: str,
+        context: str,
+        *,
+        expected_sources: Optional[Dict[str, str]] = None,
+    ) -> Tuple[List[Dict[str, str]], str]:
+        """Read multiple full-resolution CAD index sheets in one request."""
+        if not contents:
+            return [], ""
+        source_hints = {
+            item_id: str(value or "").strip()
+            for item_id, value in (expected_sources or {}).items()
+            if str(value or "").strip()
+        }
+        hint_instructions = ""
+        if source_hints:
+            hint_instructions = (
+                "\n下面 JSON 是本地 OCR 的有噪声提示，只用于辅助辨认图片字形；"
+                "它可能有错字或把图线误认为泰文，必须始终以图片为准。\n"
+                + json.dumps(source_hints, ensure_ascii=False)
+            )
+        instructions = (
+            "输入包含多张泰国建筑 CAD 索引图。每行左侧 ID 在本次请求的所有图片中全局唯一，"
+            "右侧是一条完整文字行。这是识字任务，不是翻译任务。"
+            "按图片顺序逐行读取原文，保留行内英语、数字、型号和标点。"
+            "所有图片中的每一个 ID 都必须逐一且仅返回一次，不能遗漏、合并、拆分、解释、"
+            "翻译或猜测。如果一行没有可辨认文字，source_text 写 [NO_TEXT]。"
+            "只输出 JSON 对象，格式必须为 {\"items\":[{\"id\":\"ID0001\","
+            "\"source_text\":\"完整原文\"}]}。\n"
+            f"{context_instructions(context)}"
+            f"{hint_instructions}"
+        )
+        data_urls = [
+            f"data:{media_type};base64,{base64.b64encode(content).decode('ascii')}"
+            for content in contents
+        ]
+        text, route = await self._generate_with_images(
+            instructions,
+            data_urls,
+            self.settings.openai_vision_model,
+            detail="high",
+        )
+        return parse_indexed_image_sources(text), route
+
     async def _generate_text(
         self,
         instructions: str,
@@ -956,16 +1065,45 @@ class OpenAIProvider(BaseProvider):
         *,
         detail: str = "auto",
     ) -> Tuple[str, str]:
+        return await self._generate_with_images(
+            instructions, [data_url], model, detail=detail
+        )
+
+    async def _generate_with_images(
+        self,
+        instructions: str,
+        data_urls: Sequence[str],
+        model: str,
+        *,
+        detail: str = "auto",
+    ) -> Tuple[str, str]:
+        request_text = (
+            "识别并翻译这张图片。"
+            if len(data_urls) == 1
+            else "按顺序处理这些图片。"
+        )
+        responses_content = [
+            {"type": "input_text", "text": request_text}
+        ]
+        responses_content.extend(
+            {"type": "input_image", "image_url": data_url, "detail": detail}
+            for data_url in data_urls
+        )
+        chat_content = [{"type": "text", "text": request_text}]
+        chat_content.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": data_url, "detail": detail},
+            }
+            for data_url in data_urls
+        )
         responses_payload = {
             "model": model,
             "instructions": instructions,
             "input": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "识别并翻译这张图片。"},
-                        {"type": "input_image", "image_url": data_url, "detail": detail},
-                    ],
+                    "content": responses_content,
                 }
             ],
             "reasoning": {"effort": self.settings.openai_reasoning_effort},
@@ -976,13 +1114,7 @@ class OpenAIProvider(BaseProvider):
                 {"role": "system", "content": instructions},
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": "识别并翻译这张图片。"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url, "detail": detail},
-                        },
-                    ],
+                    "content": chat_content,
                 },
             ],
             "reasoning_effort": self.settings.openai_reasoning_effort,
@@ -1011,6 +1143,33 @@ class OpenAIProvider(BaseProvider):
             semaphore = asyncio.Semaphore(self.settings.openai_max_concurrency)
             self._semaphores_by_loop[loop_id] = semaphore
         return semaphore
+
+    def _client_for_current_loop(self) -> httpx.AsyncClient:
+        loop_id = id(asyncio.get_running_loop())
+        client = self._clients_by_loop.get(loop_id)
+        if client is None or client.is_closed:
+            connection_limit = max(4, self.settings.openai_max_concurrency + 2)
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    self.request_timeout_seconds,
+                    connect=30.0,
+                ),
+                trust_env=False,
+                limits=httpx.Limits(
+                    max_connections=connection_limit,
+                    max_keepalive_connections=connection_limit,
+                    keepalive_expiry=60.0,
+                ),
+            )
+            self._clients_by_loop[loop_id] = client
+        return client
+
+    async def aclose(self) -> None:
+        loop_id = id(asyncio.get_running_loop())
+        client = self._clients_by_loop.pop(loop_id, None)
+        self._semaphores_by_loop.pop(loop_id, None)
+        if client is not None and not client.is_closed:
+            await client.aclose()
 
     async def _post_with_retry(
         self, path: str, payload: Dict[str, Any]
@@ -1048,20 +1207,19 @@ class OpenAIProvider(BaseProvider):
             "Authorization": f"Bearer {self.settings.openai_api_key}",
             "Content-Type": "application/json",
         }
-        timeout = httpx.Timeout(self.request_timeout_seconds, connect=30.0)
         try:
             # The desktop machine can have a system proxy enabled for browser
             # traffic. Large vision uploads through that proxy have remained
             # stuck after the page-level CAD timeout expired, while the
             # configured gateway is directly reachable. Keep document jobs
             # bounded and use the configured endpoint directly.
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-                async with self._semaphore_for_current_loop():
-                    return await client.post(
-                        f"{self.settings.openai_base_url}{path}",
-                        headers=headers,
-                        json=payload,
-                    )
+            client = self._client_for_current_loop()
+            async with self._semaphore_for_current_loop():
+                return await client.post(
+                    f"{self.settings.openai_base_url}{path}",
+                    headers=headers,
+                    json=payload,
+                )
         except httpx.TimeoutException as exc:
             raise RuntimeError("模型服务响应超时，请稍后重试或拆分文档") from exc
         except httpx.RequestError as exc:
@@ -1165,6 +1323,16 @@ class DemoProvider(BaseProvider):
     async def read_indexed_image_lines(
         self,
         content: bytes,
+        media_type: str,
+        context: str,
+        *,
+        expected_sources: Optional[Dict[str, str]] = None,
+    ) -> Tuple[List[Dict[str, str]], str]:
+        return [], "demo"
+
+    async def read_indexed_image_line_group(
+        self,
+        contents: Sequence[bytes],
         media_type: str,
         context: str,
         *,

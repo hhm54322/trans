@@ -1,3 +1,4 @@
+import cv2
 import fitz
 import numpy as np
 import pytest
@@ -86,6 +87,62 @@ def _text_spans(content):
         ]
     finally:
         document.close()
+
+
+def test_cad_png_network_encoding_is_pixel_exact():
+    image = np.full((120, 640, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        image,
+        "ID001 CAD 123",
+        (8, 72),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.1,
+        (0, 0, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    ok, encoded = visual_pdf._encode_cad_png(image)
+    restored = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+    assert ok is True
+    assert np.array_equal(restored, image)
+
+
+def test_pixmap_direct_conversion_matches_lossless_png_decode():
+    document = fitz.open()
+    page = document.new_page(width=160, height=90)
+    page.draw_rect(
+        fitz.Rect(8, 12, 95, 64),
+        color=(0.1, 0.4, 0.8),
+        fill=(0.9, 0.7, 0.2),
+    )
+    pixmap = page.get_pixmap(colorspace=fitz.csRGB, alpha=False)
+    expected = cv2.imdecode(
+        np.frombuffer(pixmap.tobytes("png"), dtype=np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+
+    actual = visual_pdf._pixmap_to_bgr_image(pixmap)
+    document.close()
+
+    assert np.array_equal(actual, expected)
+
+
+def test_paddle_runtime_kwargs_are_optional_and_bounded(monkeypatch):
+    monkeypatch.setattr(visual_pdf, "_PADDLE_ENABLE_MKLDNN", True)
+    monkeypatch.setenv("APP_PADDLE_DEVICE", "gpu:0")
+    monkeypatch.setenv("APP_PADDLE_CPU_THREADS", "200")
+
+    assert visual_pdf._paddle_runtime_kwargs() == {
+        "enable_mkldnn": True,
+        "device": "gpu:0",
+        "cpu_threads": 64,
+    }
+
+    monkeypatch.delenv("APP_PADDLE_DEVICE")
+    monkeypatch.delenv("APP_PADDLE_CPU_THREADS")
+    assert visual_pdf._paddle_runtime_kwargs() == {"enable_mkldnn": True}
 
 
 def test_normalize_tesseract_source_hint_joins_only_thai_gaps():
@@ -594,6 +651,39 @@ def test_dense_cad_sheet_keeps_stable_ids_and_source_geometry(monkeypatch):
     assert fitz.Rect(first["bbox"]) == fitz.Rect(10, 20, 110, 40)
 
 
+def test_dense_cad_sheet_can_use_global_ids_across_images(monkeypatch):
+    monkeypatch.setattr(
+        visual_pdf,
+        "_dense_tesseract_seed_candidates",
+        lambda _image, *, thai_only=True: [
+            {
+                "rect": fitz.Rect(5 + index * 4, 20, 30 + index * 4, 40),
+                "source_text": "ผนัง",
+                "source_confidence": 90.0,
+            }
+            for index in range(5)
+        ],
+    )
+    document = fitz.open(stream=_blank_pdf(width=200, height=100), filetype="pdf")
+    try:
+        sheets = visual_pdf.prepare_dense_cad_translation_sheets(
+            document[0],
+            1,
+            desired_width=200,
+            rows_per_sheet=2,
+            native_units=[],
+            globally_unique_ids=True,
+        )
+    finally:
+        document.close()
+
+    assert [list(sheet["entries"]) for sheet in sheets] == [
+        ["ID0001", "ID0002"],
+        ["ID0003", "ID0004"],
+        ["ID0005"],
+    ]
+
+
 def test_dense_cad_sheet_reuses_supplied_seed_rects(monkeypatch):
     monkeypatch.setattr(
         visual_pdf,
@@ -657,6 +747,77 @@ def test_dense_cad_review_sheet_marks_target_and_preserves_origin_mapping():
         (decoded[:, :, 2] > 180)
         & (decoded[:, :, 2] > decoded[:, :, 1] * 1.5)
     ) > 20
+
+
+def test_dense_cad_review_sheet_accepts_exact_cached_page_render():
+    document = fitz.open()
+    page = document.new_page(width=240, height=140)
+    page.insert_text((48, 65), "CONTEXT TARGET 123", fontsize=8)
+    candidate = {
+        "bbox": (80, 54, 145, 68),
+        "rotation": 0,
+        "vertical": False,
+        "source_hint": "ผนัง",
+        "source_confidence": 80.0,
+    }
+    try:
+        cached_png = visual_pdf.render_dense_cad_page_png(
+            page,
+            desired_width=1200,
+            minimum_render_scale=2.5,
+            maximum_render_scale=5.0,
+        )
+        direct = visual_pdf.prepare_dense_cad_review_sheets(
+            page,
+            [candidate],
+            desired_width=1200,
+            rows_per_sheet=3,
+        )
+
+        class CachedPageProxy:
+            def __getattr__(self, name):
+                return getattr(page, name)
+
+            def get_pixmap(self, *_args, **_kwargs):
+                pytest.fail("cached review render unexpectedly rerendered the PDF page")
+
+        cached = visual_pdf.prepare_dense_cad_review_sheets(
+            CachedPageProxy(),
+            [candidate],
+            desired_width=1200,
+            rows_per_sheet=3,
+            rendered_page_png=cached_png,
+        )
+    finally:
+        document.close()
+
+    assert cached[0]["content"] == direct[0]["content"]
+    assert cached[0]["entries"] == direct[0]["entries"]
+
+
+def test_dense_cad_outline_covers_share_one_page_content_stream():
+    document = fitz.open()
+    page = document.new_page(width=240, height=140)
+    page.draw_rect(page.rect, color=None, fill=(0, 0, 0))
+    before = len(page.get_contents())
+    segments = [
+        {
+            "bbox": (20.0 + index * 60.0, 30.0, 60.0 + index * 60.0, 50.0),
+            "metadata": {"rotation": 0, "dense_cad_tight_cover": True},
+        }
+        for index in range(3)
+    ]
+    try:
+        restored = visual_pdf._cover_outline_text(page, segments, [])
+        stream_count = len(page.get_contents())
+        pixmap = page.get_pixmap(colorspace=fitz.csRGB, alpha=False)
+    finally:
+        document.close()
+
+    assert restored == []
+    assert stream_count - before == 1
+    assert tuple(pixmap.pixel(30, 40)) == (255, 255, 255)
+    assert tuple(pixmap.pixel(5, 5)) == (0, 0, 0)
 
 
 def test_paddle_full_page_candidates_only_add_uncovered_thai_lines(monkeypatch):
@@ -727,6 +888,85 @@ def test_deferred_paddle_candidate_filter_matches_inline_result(monkeypatch):
         document.close()
 
     assert deferred == inline
+
+
+def test_selective_paddle_recognizes_only_new_or_larger_geometry(monkeypatch):
+    polygons = [
+        [[20, 20], [130, 20], [130, 40], [20, 40]],
+        [[160, 20], [220, 20], [220, 40], [160, 40]],
+        [[15, 17], [145, 17], [145, 43], [15, 43]],
+    ]
+
+    class FakeSelectivePipeline:
+        def __init__(self):
+            self.recognized_images = []
+
+        @staticmethod
+        def get_text_det_params(*_args):
+            return {}
+
+        @staticmethod
+        def text_det_model(_images, **_kwargs):
+            return [{"dt_polys": np.asarray(polygons)}]
+
+        @staticmethod
+        def _sort_boxes(values):
+            return values
+
+        @staticmethod
+        def _crop_by_polys(_image, values):
+            return [
+                np.zeros(
+                    (
+                        int(max(point[1] for point in polygon) - min(point[1] for point in polygon)),
+                        int(max(point[0] for point in polygon) - min(point[0] for point in polygon)),
+                        3,
+                    ),
+                    dtype=np.uint8,
+                )
+                for polygon in values
+            ]
+
+        def text_rec_model(self, images, *, return_word_box):
+            assert return_word_box is False
+            self.recognized_images = images
+            return [
+                {"rec_text": "ผนัง", "rec_score": 0.95},
+                {"rec_text": "แปลนหลังคา", "rec_score": 0.96},
+            ]
+
+    pipeline = FakeSelectivePipeline()
+    fake_ocr = SimpleNamespace(
+        paddlex_pipeline=SimpleNamespace(_pipeline=pipeline)
+    )
+    monkeypatch.setattr(visual_pdf, "_get_paddle_ocr", lambda: fake_ocr)
+    monkeypatch.setattr(
+        visual_pdf,
+        "_paddle_ocr_predict_lock",
+        lambda: visual_pdf._OCR_LOCK,
+    )
+    document = fitz.open(stream=_blank_pdf(width=240, height=140), filetype="pdf")
+    try:
+        candidates = visual_pdf.detect_dense_cad_paddle_candidates(
+            document[0],
+            desired_width=240,
+            native_units=[],
+            existing_bboxes=[(18, 18, 132, 42)],
+            defer_existing_filter=True,
+            selective_recognition=True,
+        )
+    finally:
+        document.close()
+
+    # The exactly covered first polygon never reaches recognition. The new
+    # polygon and the materially larger cover polygon both remain.
+    assert len(pipeline.recognized_images) == 2
+    assert len(candidates) == 2
+    assert {candidate["source_hint"] for candidate in candidates} == {
+        "ผนัง",
+        "แปลนหลังคา",
+    }
+    assert sum("matching_existing_index" in candidate for candidate in candidates) == 1
 
 
 def test_circular_logo_fragments_are_suppressed_below_full_phrase():

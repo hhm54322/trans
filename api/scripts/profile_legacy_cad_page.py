@@ -2,9 +2,9 @@
 """Profile the current legacy dense-CAD PDF pipeline for one source page.
 
 This diagnostic intentionally calls the production PDF pipeline unchanged. It
-only wraps selected in-process functions to emit elapsed time and counts. No
-translated document is exported, and neither source text nor model output is
-written to the report.
+only wraps selected in-process functions to emit elapsed time and counts. A
+translated comparison PDF is optional; source text and model output are never
+written to the timing report.
 """
 
 from __future__ import annotations
@@ -243,6 +243,7 @@ def _profile_page(
     rows_per_sheet: int,
     vision_concurrency: int,
     label: str,
+    export_pdf: bool = True,
 ) -> Tuple[Dict[str, Any], Timeline]:
     if not source.exists():
         raise FileNotFoundError(f"未找到测试 PDF：{source}")
@@ -337,6 +338,16 @@ def _profile_page(
             _indexed_details,
         ),
     )
+    patches.set(
+        application.translator,
+        "read_indexed_image_line_group",
+        _async_wrapper(
+            timeline,
+            "indexed_multi_image_source_read",
+            application.translator.read_indexed_image_line_group,
+            _indexed_details,
+        ),
+    )
 
     async def observed_post(path: str, payload: Dict[str, Any]):
         started_at = time.perf_counter()
@@ -360,6 +371,7 @@ def _profile_page(
         "cad_ocr_mode": os.getenv("APP_CAD_OCR_MODE", "auto"),
         "pdf_ocr_concurrency": application.settings.pdf_ocr_concurrency,
         "rows_per_sheet": rows_per_sheet,
+        "images_per_request": application.CAD_INDEXED_IMAGES_PER_REQUEST,
         "vision_concurrency": vision_concurrency,
         "model": application.settings.openai_model,
         "vision_model": application.settings.openai_vision_model,
@@ -379,35 +391,36 @@ def _profile_page(
                 report_progress,
             )
         )
-        export_started_at = time.perf_counter()
-        export_directory = OUTPUT_DIRECTORY / "exports"
-        exported = create_document_export(
-            item_id=(
-                f"profile-page-{source_page}-rows-{rows_per_sheet}"
-                f"-concurrency-{vision_concurrency}-{label}"
-            ),
-            source_filename=f"{source.stem}-source-page-{source_page}.pdf",
-            source_content=content,
-            translated_text=result.translated_text,
-            target_language="zh",
-            output_directory=export_directory,
-            layout_segments=result.layout_segments,
-            prepared_pdf_content=result.prepared_pdf_content,
-        )
-        timeline.record(
-            "formatted_pdf_export",
-            export_started_at,
-            output_bytes=exported.path.stat().st_size,
-            output_path=str(exported.path),
-        )
         outcome = {
             "status": "completed",
             "layout_segment_count": len(result.layout_segments),
             "source_character_count": len(source_text),
             "provider": result.provider,
             "warning_count": len(result.warnings),
-            "formatted_pdf_export": str(exported.path),
         }
+        if export_pdf:
+            export_started_at = time.perf_counter()
+            export_directory = OUTPUT_DIRECTORY / "exports"
+            exported = create_document_export(
+                item_id=(
+                    f"profile-page-{source_page}-rows-{rows_per_sheet}"
+                    f"-concurrency-{vision_concurrency}-{label}"
+                ),
+                source_filename=f"{source.stem}-source-page-{source_page}.pdf",
+                source_content=content,
+                translated_text=result.translated_text,
+                target_language="zh",
+                output_directory=export_directory,
+                layout_segments=result.layout_segments,
+                prepared_pdf_content=result.prepared_pdf_content,
+            )
+            timeline.record(
+                "formatted_pdf_export",
+                export_started_at,
+                output_bytes=exported.path.stat().st_size,
+                output_path=str(exported.path),
+            )
+            outcome["formatted_pdf_export"] = str(exported.path)
     except BaseException as exc:
         outcome = {"status": "failed", "error_type": type(exc).__name__, "error": str(exc)}
         pipeline_failure = exc
@@ -444,6 +457,11 @@ def _arguments() -> argparse.Namespace:
         default="run",
         help="本次基准的 ASCII 标识，避免覆盖既有结果",
     )
+    parser.add_argument(
+        "--no-export",
+        action="store_true",
+        help="只记录管线耗时，不生成 PDF 对照件",
+    )
     return parser.parse_args()
 
 
@@ -469,6 +487,7 @@ def main() -> int:
             rows_per_sheet=arguments.rows_per_sheet,
             vision_concurrency=arguments.vision_concurrency,
             label=arguments.label,
+            export_pdf=not arguments.no_export,
         )
     except BaseException as exc:
         print(f"legacy_cad_profile_failed error={type(exc).__name__}: {exc}", file=sys.stderr)

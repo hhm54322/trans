@@ -31,6 +31,7 @@ class TranslationResponse(BaseModel):
 class DocumentJobResponse(BaseModel):
     job_id: str
     status: Literal["processing", "completed", "failed"]
+    stage: str
     completed_pages: int = Field(ge=0)
     total_pages: int = Field(ge=1)
     progress: int = Field(ge=0, le=100)

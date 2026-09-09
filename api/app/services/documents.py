@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from io import BytesIO, StringIO
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
@@ -324,10 +324,16 @@ def pdf_page_count(content: bytes) -> int:
 
 
 def iter_pdf_pages(
-    content: bytes, source_language: str = "auto"
+    content: bytes,
+    source_language: str = "auto",
+    prepared_callback: Optional[Callable[[Optional[bytes]], None]] = None,
 ) -> Iterator[ParsedPdfPage]:
     try:
-        with NativePdfExtractor(content, source_language) as extractor:
+        with NativePdfExtractor(
+            content,
+            source_language,
+            prepare_source=prepared_callback is not None,
+        ) as extractor:
             for page_number, units, profile in extractor.iter_pages():
                 # Vector-heavy pages may combine selectable title-block text
                 # with outlined table text. Keep the reliable native units and
@@ -344,6 +350,8 @@ def iter_pdf_pages(
                     profile=profile,
                     processing_route=plan.route.value,
                 )
+            if prepared_callback is not None:
+                prepared_callback(extractor.prepared_pdf_content())
     except Exception as exc:
         raise ValueError("PDF 页面内容解析失败，请检查文件内容") from exc
 

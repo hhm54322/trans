@@ -22,7 +22,10 @@ import pikepdf
 # before any lazy PaddleOCR import below.
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
+_PADDLE_ENABLE_MKLDNN = os.getenv(
+    "APP_PADDLE_ENABLE_MKLDNN", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+os.environ.setdefault("FLAGS_use_mkldnn", "1" if _PADDLE_ENABLE_MKLDNN else "0")
 
 
 NATIVE_ENGINE_VERSION = 1
@@ -50,6 +53,54 @@ _CAD_DETECTION_TILE_OVERLAP = 256
 _LETTER_PATTERN = re.compile(r"[A-Za-z\u0E00-\u0E7F\u4E00-\u9FFF]")
 _CJK_PATTERN = re.compile(r"[\u4E00-\u9FFF]")
 _THAI_LATIN_PATTERN = re.compile(r"[A-Za-z\u0E00-\u0E7F]")
+_CAD_PNG_COMPRESSION_LEVEL = 3
+
+
+def _encode_cad_png(image):
+    """Encode network-bound CAD sheets losslessly with modest compression."""
+    import cv2
+
+    return cv2.imencode(
+        ".png",
+        image,
+        [cv2.IMWRITE_PNG_COMPRESSION, _CAD_PNG_COMPRESSION_LEVEL],
+    )
+
+
+def _paddle_runtime_kwargs() -> Dict[str, Any]:
+    """Build quality-neutral Paddle backend settings for this deployment."""
+    kwargs: Dict[str, Any] = {"enable_mkldnn": _PADDLE_ENABLE_MKLDNN}
+    device = os.getenv("APP_PADDLE_DEVICE", "").strip()
+    if device:
+        kwargs["device"] = device
+    cpu_threads = os.getenv("APP_PADDLE_CPU_THREADS", "").strip()
+    if cpu_threads:
+        kwargs["cpu_threads"] = max(1, min(64, int(cpu_threads)))
+    return kwargs
+
+
+def _pixmap_to_bgr_image(pixmap):
+    """Convert an RGB pixmap without a lossless PNG encode/decode round trip."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("PDF 页面图像运行环境不完整") from exc
+    if pixmap.n != 3:
+        raise ValueError("CAD 页面渲染必须使用 RGB 色彩空间")
+    row_bytes = pixmap.width * pixmap.n
+    samples = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+        pixmap.height, pixmap.stride
+    )
+    rgb = samples[:, :row_bytes].reshape(pixmap.height, pixmap.width, pixmap.n)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def _render_page_bgr_image(page, scale: float):
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
+    )
+    return _pixmap_to_bgr_image(pixmap)
 
 
 def extract_native_page_units(page, page_number: int) -> List[Dict[str, Any]]:
@@ -144,17 +195,11 @@ def extract_table_ocr_units(
         scale_limit,
         max(1.0, desired_width / max(1.0, page.rect.width)),
     )
-    pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
-    )
     try:
         import cv2
-        import numpy as np
     except ImportError as exc:
         raise RuntimeError("PaddleOCR 运行环境不完整") from exc
-    image = cv2.imdecode(np.frombuffer(pixmap.tobytes("png"), dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
-        raise RuntimeError("PDF 页面无法转换为 OCR 图像")
+    image = _render_page_bgr_image(page, scale)
     if raster_scale:
         image = _remove_significant_blue_ink(image, scale)
     try:
@@ -1012,6 +1057,26 @@ def _dense_fast_ocr_candidates(
     return candidates
 
 
+def render_dense_cad_page_png(
+    page,
+    *,
+    desired_width: int,
+    minimum_render_scale: float,
+    maximum_render_scale: float,
+) -> bytes:
+    """Render one exact CAD page image for reuse by multiple OCR stages."""
+    if minimum_render_scale <= 0 or maximum_render_scale < minimum_render_scale:
+        raise ValueError("CAD 页面渲染倍率无效")
+    scale = min(
+        maximum_render_scale,
+        max(minimum_render_scale, desired_width / max(1.0, page.rect.width)),
+    )
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
+    )
+    return pixmap.tobytes("png")
+
+
 def prepare_dense_cad_translation_sheets(
     page,
     page_number: int,
@@ -1024,6 +1089,8 @@ def prepare_dense_cad_translation_sheets(
     seed_rects: Optional[Sequence[Sequence[float]]] = None,
     seed_candidates: Optional[Sequence[Dict[str, Any]]] = None,
     detection_provider: str = "tesseract",
+    globally_unique_ids: bool = False,
+    rendered_page_png: Optional[bytes] = None,
 ):
     """Render indexed CAD line crops for GPT recognition and translation."""
     try:
@@ -1034,17 +1101,17 @@ def prepare_dense_cad_translation_sheets(
 
     if minimum_render_scale <= 0:
         raise ValueError("CAD 索引图最小渲染倍率必须大于 0")
-    scale = min(
-        2.0,
-        max(minimum_render_scale, desired_width / max(1.0, page.rect.width)),
-    )
-    pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
-    )
-    image = cv2.imdecode(
-        np.frombuffer(pixmap.tobytes("png"), dtype=np.uint8),
-        cv2.IMREAD_COLOR,
-    )
+    if rendered_page_png is None:
+        scale = min(
+            2.0,
+            max(minimum_render_scale, desired_width / max(1.0, page.rect.width)),
+        )
+        image = _render_page_bgr_image(page, scale)
+    else:
+        image = cv2.imdecode(
+            np.frombuffer(rendered_page_png, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
     if image is None:
         raise RuntimeError("PDF 页面无法转换为 CAD 索引图")
     supplemental_units = _diagonal_colored_watermark_units(
@@ -1175,7 +1242,11 @@ def prepare_dense_cad_translation_sheets(
                 top : top + crop.shape[0],
                 label_width : label_width + crop.shape[1],
             ] = crop
-            item_id = f"ID{row_index:03d}"
+            item_id = (
+                f"ID{sheet_index + row_index:04d}"
+                if globally_unique_ids
+                else f"ID{row_index:03d}"
+            )
             candidate["sheet_row"] = row_index - 1
             cv2.putText(
                 canvas,
@@ -1188,7 +1259,7 @@ def prepare_dense_cad_translation_sheets(
                 cv2.LINE_AA,
             )
             entries[item_id] = candidate
-        ok, encoded = cv2.imencode(".png", canvas)
+        ok, encoded = _encode_cad_png(canvas)
         if ok and entries:
             sheets.append(
                 {
@@ -1248,7 +1319,7 @@ def subset_indexed_translation_sheet(
     if not rows:
         return {"content": b"", "entries": {}}
     retry_image = np.concatenate(rows, axis=0)
-    ok, encoded = cv2.imencode(".png", retry_image)
+    ok, encoded = _encode_cad_png(retry_image)
     if not ok:
         raise RuntimeError("CAD 索引图无法生成定向重试图")
     return {
@@ -1266,13 +1337,16 @@ def detect_dense_cad_paddle_candidates(
     native_units: Optional[Sequence[Dict[str, Any]]] = None,
     existing_bboxes: Optional[Sequence[Sequence[float]]] = None,
     defer_existing_filter: bool = False,
+    selective_recognition: bool = False,
+    rendered_page_png: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
     """Find CAD text missed by Tesseract using one full-page Paddle pass.
 
-    Native text is independent of the indexed Tesseract candidates. Callers
-    that build those candidates concurrently can defer just the final
-    candidate-to-candidate comparison without changing Paddle's input or its
-    detected text boxes.
+    When indexed Tesseract boxes are already available, selective recognition
+    runs the same Paddle detector first and recognizes only boxes that may add
+    text or materially improve a cover rectangle. GPT still reviews every new
+    candidate from its source crop, so local transcription remains a gate and
+    hint rather than the final translated content.
     """
     try:
         import cv2
@@ -1280,16 +1354,28 @@ def detect_dense_cad_paddle_candidates(
     except ImportError as exc:
         raise RuntimeError("PaddleOCR 运行环境不完整") from exc
 
-    scale = min(2.0, max(1.0, desired_width / max(1.0, page.rect.width)))
-    pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
-    )
-    image = cv2.imdecode(
-        np.frombuffer(pixmap.tobytes("png"), dtype=np.uint8),
-        cv2.IMREAD_COLOR,
-    )
+    if rendered_page_png is None:
+        scale = min(
+            2.0,
+            max(1.0, desired_width / max(1.0, page.rect.width)),
+        )
+        image = _render_page_bgr_image(page, scale)
+    else:
+        image = cv2.imdecode(
+            np.frombuffer(rendered_page_png, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
     if image is None:
         raise RuntimeError("PDF 页面无法转换为 CAD 检测图")
+    if selective_recognition and existing_bboxes:
+        selective = _detect_dense_cad_paddle_candidates_selective(
+            page,
+            image,
+            native_units=native_units,
+            existing_bboxes=existing_bboxes,
+        )
+        if selective is not None:
+            return selective
     ocr = _get_paddle_ocr()
     with _paddle_ocr_predict_lock():
         results = list(ocr.predict(image))
@@ -1344,6 +1430,163 @@ def detect_dense_cad_paddle_candidates(
     )
 
 
+def _detect_dense_cad_paddle_candidates_selective(
+    page,
+    image,
+    *,
+    native_units: Optional[Sequence[Dict[str, Any]]],
+    existing_bboxes: Sequence[Sequence[float]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Use the cached Paddle pipeline while pruning recognition-only work.
+
+    Detection remains identical to ``PaddleOCR.predict``. Only recognition is
+    skipped for geometry that the existing indexed boxes already cover and
+    that cannot expand a write-back rectangle. ``None`` means the installed
+    Paddle version does not expose the pinned pipeline components and the
+    caller should use the public full-page API.
+    """
+    try:
+        ocr = _get_paddle_ocr()
+        pipeline = ocr.paddlex_pipeline._pipeline
+        required = (
+            pipeline.get_text_det_params,
+            pipeline.text_det_model,
+            pipeline.text_rec_model,
+            pipeline._sort_boxes,
+            pipeline._crop_by_polys,
+        )
+    except (AttributeError, TypeError):
+        return None
+    if not all(required):
+        return None
+
+    native_rects = [
+        fitz.Rect(unit["bbox"])
+        for unit in native_units or []
+        if isinstance(unit.get("bbox"), (list, tuple)) and len(unit["bbox"]) == 4
+    ]
+    covered_rects = [fitz.Rect(values) for values in existing_bboxes]
+    page_rotation = int(page.rotation) % 360
+    vertical_rotation = _display_direction_to_unrotated_rotation(
+        page, (0.0, -1.0)
+    )
+
+    with _paddle_ocr_predict_lock():
+        try:
+            detection_parameters = pipeline.get_text_det_params(
+                None, None, None, None, None, None
+            )
+        except (AttributeError, TypeError):
+            return None
+        detection_results = list(
+            pipeline.text_det_model([image], **detection_parameters)
+        )
+        if not detection_results:
+            return []
+        raw_polygons = detection_results[0].get("dt_polys")
+        if raw_polygons is None:
+            return []
+        polygons = list(pipeline._sort_boxes(raw_polygons))
+        prepared = []
+        for polygon in polygons:
+            pixel_rect = _polygon_rect(polygon)
+            if pixel_rect.is_empty:
+                continue
+            page_rect = _ocr_polygon_to_unrotated_rect(
+                page, polygon, image.shape[1], image.shape[0]
+            )
+            if page_rect.is_empty or max(page_rect.width, page_rect.height) < 7.0:
+                continue
+            if any(
+                _overlap_smaller(page_rect, rect) >= 0.50
+                for rect in native_rects
+            ):
+                continue
+            matching_index, materially_larger = _paddle_existing_match(
+                page_rect, covered_rects, page_rotation
+            )
+            if matching_index is not None and not materially_larger:
+                continue
+            vertical = pixel_rect.height > pixel_rect.width * 1.5
+            candidate = {
+                "bbox": tuple(page_rect),
+                "rotation": vertical_rotation if vertical else page_rotation,
+                "vertical": vertical,
+                "source_hint": "",
+                "source_confidence": 0.0,
+                "candidate_provider": "paddle-full-page",
+            }
+            if matching_index is not None:
+                candidate["matching_existing_index"] = matching_index
+            prepared.append((polygon, candidate))
+
+        if not prepared:
+            return []
+        crops = list(
+            pipeline._crop_by_polys(
+                image, [polygon for polygon, _candidate in prepared]
+            )
+        )
+        valid = [
+            (index, crop)
+            for index, crop in enumerate(crops)
+            if getattr(crop, "size", 0)
+            and crop.shape[0] > 0
+            and crop.shape[1] > 0
+        ]
+        sorted_crops = sorted(
+            valid,
+            key=lambda item: item[1].shape[1] / float(item[1].shape[0]),
+        )
+        recognized_by_index = {}
+        for result_index, recognition in enumerate(
+            pipeline.text_rec_model(
+                [crop for _index, crop in sorted_crops],
+                return_word_box=False,
+            )
+        ):
+            recognized_by_index[sorted_crops[result_index][0]] = recognition
+
+    candidates = []
+    for index, (_polygon, candidate) in enumerate(prepared):
+        recognition = recognized_by_index.get(index)
+        if not recognition:
+            continue
+        source_text = _normalize_tesseract_source_hint(
+            str(recognition.get("rec_text") or "")
+        )
+        score = float(recognition.get("rec_score") or 0.0)
+        if score < 0.40 or not re.search(r"[\u0E00-\u0E7F]", source_text):
+            continue
+        candidate["source_hint"] = source_text
+        candidate["source_confidence"] = score * 100.0
+        candidates.append(candidate)
+    return filter_dense_cad_paddle_candidates(
+        candidates,
+        existing_bboxes=existing_bboxes,
+        page_rotation=page_rotation,
+    )
+
+
+def _paddle_existing_match(page_rect, covered_rects, page_rotation):
+    matching_index = next(
+        (
+            index
+            for index, rect in enumerate(covered_rects)
+            if _same_ocr_line(page_rect, rect, page_rotation)
+        ),
+        None,
+    )
+    if matching_index is None:
+        return None, False
+    existing_rect = covered_rects[matching_index]
+    materially_larger = (
+        page_rect.get_area() >= existing_rect.get_area() * 1.18
+        or page_rect.width >= existing_rect.width * 1.12
+    )
+    return matching_index, materially_larger
+
+
 def filter_dense_cad_paddle_candidates(
     candidates: Sequence[Dict[str, Any]],
     *,
@@ -1362,22 +1605,10 @@ def filter_dense_cad_paddle_candidates(
     for original in candidates:
         candidate = dict(original)
         page_rect = fitz.Rect(candidate["bbox"])
-        matching_existing_index = next(
-            (
-                index
-                for index, rect in enumerate(covered_rects)
-                if _same_ocr_line(page_rect, rect, page_rotation)
-            ),
-            None,
+        matching_existing_index, materially_larger = _paddle_existing_match(
+            page_rect, covered_rects, page_rotation
         )
         if matching_existing_index is not None:
-            existing_rect = covered_rects[matching_existing_index]
-            paddle_along = page_rect.width
-            existing_along = existing_rect.width
-            materially_larger = (
-                page_rect.get_area() >= existing_rect.get_area() * 1.18
-                or paddle_along >= existing_along * 1.12
-            )
             if not materially_larger:
                 continue
             candidate["matching_existing_index"] = matching_existing_index
@@ -1413,6 +1644,7 @@ def prepare_dense_cad_review_sheets(
     desired_width: int = 6400,
     rows_per_sheet: int = 3,
     wide_context: bool = False,
+    rendered_page_png: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
     """Render unresolved CAD lines sharply with marked surrounding context.
 
@@ -1430,13 +1662,13 @@ def prepare_dense_cad_review_sheets(
     if not candidates:
         return []
     scale = min(5.0, max(2.5, desired_width / max(1.0, page.rect.width)))
-    pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
-    )
-    image = cv2.imdecode(
-        np.frombuffer(pixmap.tobytes("png"), dtype=np.uint8),
-        cv2.IMREAD_COLOR,
-    )
+    if rendered_page_png is None:
+        image = _render_page_bgr_image(page, scale)
+    else:
+        image = cv2.imdecode(
+            np.frombuffer(rendered_page_png, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
     if image is None:
         raise RuntimeError("PDF 页面无法转换为 CAD 高清复核图")
 
@@ -1679,7 +1911,7 @@ def prepare_dense_cad_review_sheets(
                     cv2.LINE_AA,
                 )
             entries[review_id] = candidate
-        ok, encoded = cv2.imencode(".png", canvas)
+        ok, encoded = _encode_cad_png(canvas)
         if ok and entries:
             sheets.append(
                 {
@@ -1768,15 +2000,7 @@ def recover_dense_cad_review_text_lines(
     if not candidates:
         return []
     scale = min(5.0, max(2.5, desired_width / max(1.0, page.rect.width)))
-    pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
-    )
-    image = cv2.imdecode(
-        np.frombuffer(pixmap.tobytes("png"), dtype=np.uint8),
-        cv2.IMREAD_COLOR,
-    )
-    if image is None:
-        raise RuntimeError("PDF 页面无法转换为 CAD 局部复核图")
+    image = _render_page_bgr_image(page, scale)
 
     image_height, image_width = image.shape[:2]
     display_scale_x = image_width / max(1.0, page.rect.width)
@@ -3288,6 +3512,7 @@ def build_visual_pdf_export(
                 page, outlined, _structural_lines(page, drawings)
             )
             _restore_table_lines(page, restored_lines)
+            text_shape = page.new_shape()
             for segment in write_segments:
                 _insert_translation(
                     page,
@@ -3295,7 +3520,10 @@ def build_visual_pdf_export(
                     target_language,
                     font_path,
                     native_content_rect,
+                    write_shape=text_shape,
                 )
+            if write_segments:
+                text_shape.commit(overlay=True)
             for segment in diagonal_watermarks:
                 _replace_diagonal_watermark(page, segment, font_path)
         output = document.tobytes(garbage=4, deflate=True)
@@ -3499,6 +3727,8 @@ def _cover_outline_text(page, segments: Sequence[Dict[str, Any]], source_lines):
     if not segments:
         return []
     touched = []
+    cover_shape = page.new_shape()
+    cover_count = 0
     for segment in segments:
         rect = fitz.Rect((segment.get("metadata") or {}).get("cover_bbox", segment["bbox"]))
         rotation = int((segment.get("metadata") or {}).get("rotation", 0)) % 360
@@ -3509,11 +3739,18 @@ def _cover_outline_text(page, segments: Sequence[Dict[str, Any]], source_lines):
             else max(1.5, min(12.0, cross_size * 0.22))
         )
         cover = rect + (-padding, -padding, padding, padding)
-        page.draw_rect(cover, color=None, fill=(1, 1, 1), overlay=True)
+        cover_shape.draw_rect(cover)
+        cover_count += 1
         for line in source_lines:
             clipped = _clip_line_to_rect(line, cover)
             if clipped is not None:
                 touched.append(clipped)
+    if cover_count:
+        # Hundreds of one-rectangle content streams dominate dense CAD export.
+        # One page-level shape paints the same white covers in the same overlay
+        # layer while keeping every source rectangle and restored line intact.
+        cover_shape.finish(color=None, fill=(1, 1, 1))
+        cover_shape.commit(overlay=True)
     return _deduplicate_lines(touched)
 
 
@@ -3627,6 +3864,8 @@ def _insert_translation(
     target_language,
     font_path: Path,
     native_content_rect: fitz.Rect,
+    *,
+    write_shape=None,
 ) -> None:
     metadata = segment.get("metadata") or {}
     rect = fitz.Rect(metadata.get("write_bbox", segment["bbox"]))
@@ -3696,18 +3935,28 @@ def _insert_translation(
     )
     if fitted_size is None:
         raise ValueError(f"LAYOUT_OVERFLOW: {segment['segment_id']}")
-    spare = page.insert_textbox(
-        rect,
-        plain_text,
-        fontname="MetaTransVisual",
-        fontfile=str(font_path),
-        fontsize=fitted_size,
-        lineheight=lineheight,
-        color=rgb,
-        align=align_value,
-        rotate=rotation,
-        overlay=True,
-    )
+    textbox_args = {
+        "fontname": "MetaTransVisual",
+        "fontfile": str(font_path),
+        "fontsize": fitted_size,
+        "lineheight": lineheight,
+        "color": rgb,
+        "align": align_value,
+        "rotate": rotation,
+    }
+    if write_shape is None:
+        spare = page.insert_textbox(
+            rect,
+            plain_text,
+            overlay=True,
+            **textbox_args,
+        )
+    else:
+        spare = write_shape.insert_textbox(
+            rect,
+            plain_text,
+            **textbox_args,
+        )
     if spare < 0:
         raise ValueError(f"LAYOUT_OVERFLOW: {segment['segment_id']}")
 
@@ -4029,7 +4278,7 @@ def _get_paddle_ocr():
                 text_det_thresh=0.2,
                 text_det_box_thresh=0.4,
                 text_rec_score_thresh=0.3,
-                enable_mkldnn=False,
+                **_paddle_runtime_kwargs(),
             )
             _OCR_THREAD_LOCAL.engine = engine
             _OCR_THREAD_LOCAL.predict_lock = threading.Lock()
@@ -4054,7 +4303,7 @@ def _get_cad_text_detector():
                 model_name="PP-OCRv5_mobile_det",
                 limit_side_len=1600,
                 limit_type="max",
-                enable_mkldnn=False,
+                **_paddle_runtime_kwargs(),
             )
     return _CAD_TEXT_DETECTOR
 
@@ -4079,7 +4328,7 @@ def _get_text_recognizer():
         if _TEXT_RECOGNIZER is None:
             _TEXT_RECOGNIZER = TextRecognition(
                 model_name="th_PP-OCRv5_mobile_rec",
-                enable_mkldnn=False,
+                **_paddle_runtime_kwargs(),
             )
     return _TEXT_RECOGNIZER
 

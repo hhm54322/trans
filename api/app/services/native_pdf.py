@@ -61,7 +61,13 @@ class _CodeToken:
 class NativePdfExtractor:
     """Extract selected source-language text that maps to PDF text-show operators."""
 
-    def __init__(self, content: bytes, source_language: str = "auto"):
+    def __init__(
+        self,
+        content: bytes,
+        source_language: str = "auto",
+        *,
+        prepare_source: bool = False,
+    ):
         if source_language not in {"auto", *SUPPORTED_DOCUMENT_LANGUAGES}:
             raise ValueError("PDF 源语言无效")
         self.source_language = source_language
@@ -73,6 +79,8 @@ class NativePdfExtractor:
         if self.document.page_count != len(self.reader.pages):
             self.document.close()
             raise ValueError("PDF 页面结构不一致")
+        self.prepare_source = prepare_source
+        self.prepared_source_changed = False
 
     def close(self) -> None:
         self.document.close()
@@ -94,18 +102,14 @@ class NativePdfExtractor:
             yield page_number, units, profile
 
     def _extract_page(self, page, pdf_page, page_number: int):
-        tokens, unsupported_show_ops = _page_code_tokens(pdf_page)
-        content_characters = [
-            (character, token.ref)
-            for token in tokens
-            for character in token.value
-        ]
         raw_lines = _raw_page_lines(page)
         try:
             drawings = page.get_cdrawings()
         except Exception:
             drawings = page.get_drawings()
-        table_cells = _native_pdf_table_cells(page)
+        image_count = len(page.get_images(full=True))
+        drawing_count = len(drawings)
+        vector_scan = drawing_count >= VECTOR_SCAN_DRAWING_THRESHOLD
         effective_source_language = _resolve_page_source_language(
             raw_lines, self.source_language
         )
@@ -116,6 +120,24 @@ class NativePdfExtractor:
             if _is_language_character(entry["char"], effective_source_language)
         ]
         raw_characters = [entry for line in raw_lines for entry in line["entries"]]
+        parsed_streams = None
+        if source_characters and self.prepare_source:
+            tokens, unsupported_show_ops, parsed_streams = _parse_page_code_tokens(
+                pdf_page
+            )
+        elif source_characters:
+            tokens, unsupported_show_ops = _page_code_tokens(pdf_page)
+        else:
+            # No character in the selected source language can produce a
+            # translation unit. Avoid parsing enormous CAD content streams
+            # merely to prove again that there is nothing to map or remove.
+            tokens, unsupported_show_ops = [], 0
+            parsed_streams = [] if self.prepare_source else None
+        content_characters = [
+            (character, token.ref)
+            for token in tokens
+            for character in token.value
+        ]
         mapping_reliable = _map_raw_characters_to_content_tokens(
             raw_characters, content_characters
         )
@@ -154,13 +176,22 @@ class NativePdfExtractor:
                 skipped_directions += skipped
 
         if mapping_reliable:
+            # Table cells only affect mapped native placements. Running
+            # PyMuPDF table recognition on a vector-heavy page can take many
+            # seconds. Dense-vector pages already keep every native line at
+            # its measured geometry and use the CAD supplement for outlined
+            # text, so generic table discovery cannot improve their route.
+            # Ordinary native/table documents remain below the deliberately
+            # high dense-vector threshold and retain cell-aware layout.
+            table_cells = (
+                _native_pdf_table_cells(page)
+                if units and not vector_scan
+                else []
+            )
             units = _annotate_native_table_cells(units, table_cells, page.rect)
             units = _annotate_native_vertical_lists(units)
             units = _merge_native_paragraph_units(units)
 
-        image_count = len(page.get_images(full=True))
-        drawing_count = len(drawings)
-        vector_scan = drawing_count >= VECTOR_SCAN_DRAWING_THRESHOLD
         image_scan = image_count > 0 and not units
         visual_required = vector_scan or image_scan
         table_like = bool(
@@ -229,7 +260,28 @@ class NativePdfExtractor:
             "native_text_complete": native_text_complete,
             "native_pdf_version": NATIVE_ENGINE_VERSION,
         }
+        if self.prepare_source and mapping_reliable:
+            selected = {
+                _code_ref_key(reference)
+                for unit in units
+                for reference in (unit.get("metadata") or {}).get("code_refs", [])
+            }
+            if selected:
+                _rewrite_page_text_streams(
+                    self.document,
+                    pdf_page,
+                    selected,
+                    parsed_streams=parsed_streams,
+                )
+                self.prepared_source_changed = True
         return units, profile
+
+    def prepared_pdf_content(self) -> Optional[bytes]:
+        if not self.prepare_source or not self.prepared_source_changed:
+            return None
+        # Match prepare_native_pdf_source: this intermediate remains
+        # uncompressed so the final export can make the only costly cleanup.
+        return self.document.tobytes(garbage=0, deflate=False)
 
 
 def _looks_like_native_table(drawings, page_rect) -> bool:
@@ -382,12 +434,18 @@ def prepare_native_pdf_source(
 
 
 def _page_code_tokens(pdf_page) -> Tuple[List[_CodeToken], int]:
+    tokens, unsupported_show_ops, _ = _parse_page_code_tokens(pdf_page)
+    return tokens, unsupported_show_ops
+
+
+def _parse_page_code_tokens(pdf_page):
     fonts = _font_maps(pdf_page)
     width_maps = {
         name: build_font_width_map(font_map[4], 1000.0)
         for name, font_map in fonts.items()
     }
     tokens: List[_CodeToken] = []
+    parsed_streams = []
     unsupported_show_ops = 0
     current_font = None
     current_width_map = None
@@ -396,6 +454,7 @@ def _page_code_tokens(pdf_page) -> Tuple[List[_CodeToken], int]:
         if not _contains_text_show_operator(data):
             continue
         content = ContentStream(stream, pdf_page.pdf)
+        parsed_streams.append((stream_xref, content))
         for operation_index, (operands, operator) in enumerate(content.operations):
             if operator == b"Tf":
                 current_font = fonts.get(operands[0])
@@ -426,7 +485,7 @@ def _page_code_tokens(pdf_page) -> Tuple[List[_CodeToken], int]:
                                 current_width_map,
                             )
                         )
-    return tokens, unsupported_show_ops
+    return tokens, unsupported_show_ops, parsed_streams
 
 
 def _raw_page_lines(page):
@@ -1241,7 +1300,13 @@ def _string_tokens(
     return tokens
 
 
-def _rewrite_page_text_streams(document, pdf_page, selected: set) -> None:
+def _rewrite_page_text_streams(
+    document,
+    pdf_page,
+    selected: set,
+    *,
+    parsed_streams=None,
+) -> None:
     fonts = _font_maps(pdf_page)
     width_maps = {
         name: build_font_width_map(font_map[4], 1000.0)
@@ -1250,11 +1315,14 @@ def _rewrite_page_text_streams(document, pdf_page, selected: set) -> None:
     found = set()
     current_font = None
     current_width_map = None
-    for stream_xref, stream in _page_content_streams(pdf_page):
-        data = stream.get_data()
-        if not _contains_text_show_operator(data):
-            continue
-        content = ContentStream(stream, pdf_page.pdf)
+    if parsed_streams is None:
+        parsed_streams = []
+        for stream_xref, stream in _page_content_streams(pdf_page):
+            data = stream.get_data()
+            if not _contains_text_show_operator(data):
+                continue
+            parsed_streams.append((stream_xref, ContentStream(stream, pdf_page.pdf)))
+    for stream_xref, content in parsed_streams:
         rewritten = []
         changed = False
         for operation_index, (operands, operator) in enumerate(content.operations):

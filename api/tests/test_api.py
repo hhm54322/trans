@@ -64,6 +64,240 @@ def setup_module():
         TEST_DATABASE.unlink()
 
 
+def test_cad_local_ocr_coordinator_prioritizes_locator_then_shares_paddle():
+    async def scenario():
+        coordinator = main_module._CadLocalOcrCoordinator(2)
+        events = []
+        first_paddle_acquired = asyncio.Event()
+        release_first_paddle = asyncio.Event()
+        release_exclusive = asyncio.Event()
+        both_paddles_acquired = asyncio.Event()
+
+        async def first_paddle():
+            async with coordinator.paddle():
+                events.append("paddle-1")
+                first_paddle_acquired.set()
+                await release_first_paddle.wait()
+
+        async def exclusive_locator():
+            async with coordinator.exclusive():
+                events.append("locator")
+                await release_exclusive.wait()
+
+        async def second_paddle():
+            async with coordinator.paddle():
+                events.append("paddle-2")
+
+        first_task = asyncio.create_task(first_paddle())
+        await first_paddle_acquired.wait()
+        locator_task = asyncio.create_task(exclusive_locator())
+        await asyncio.sleep(0)
+        second_task = asyncio.create_task(second_paddle())
+        await asyncio.sleep(0)
+        assert events == ["paddle-1"]
+
+        release_first_paddle.set()
+        while events == ["paddle-1"]:
+            await asyncio.sleep(0)
+        assert events == ["paddle-1", "locator"]
+
+        release_exclusive.set()
+        await asyncio.gather(first_task, locator_task, second_task)
+        assert events == ["paddle-1", "locator", "paddle-2"]
+
+        concurrent = main_module._CadLocalOcrCoordinator(2)
+        release_paddles = asyncio.Event()
+        active = 0
+
+        async def shared_paddle():
+            nonlocal active
+            async with concurrent.paddle():
+                active += 1
+                if active == 2:
+                    both_paddles_acquired.set()
+                await release_paddles.wait()
+
+        shared_tasks = [asyncio.create_task(shared_paddle()) for _ in range(2)]
+        await asyncio.wait_for(both_paddles_acquired.wait(), timeout=1)
+        release_paddles.set()
+        await asyncio.gather(*shared_tasks)
+
+    asyncio.run(scenario())
+
+
+def test_slow_structured_translation_uses_delayed_hedge(monkeypatch):
+    calls = 0
+
+    async def translate_segments(
+        segments,
+        source_language,
+        _target_language,
+        _context,
+        *,
+        require_complete,
+    ):
+        nonlocal calls
+        calls += 1
+        call_number = calls
+        await asyncio.sleep(0.10 if call_number == 1 else 0.001)
+        return SegmentTranslationResult(
+            source_language=source_language,
+            translations={segment_id: "译文" for segment_id in segments},
+            provider=f"provider-{call_number}",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(main_module, "TEXT_MODEL_HEDGE_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(
+        main_module.database,
+        "find_matching_knowledge",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        main_module.translator, "translate_segments", translate_segments
+    )
+    batch = [
+        DocumentSegment(
+            segment_id="cad:p1:source:001",
+            page_number=1,
+            text="ข้อความ",
+            source_kind="outline-text",
+            bbox=(0, 0, 10, 10),
+            metadata={},
+        )
+    ]
+
+    async def run_batch():
+        return await main_module._translate_document_segment_batch(
+            batch,
+            "th",
+            "zh",
+            "",
+            asyncio.Semaphore(2),
+        )
+
+    translations, providers, _warnings = asyncio.run(run_batch())
+
+    assert translations == {"cad:p1:source:001": "译文"}
+    assert providers == ["provider-2"]
+    assert calls == 2
+
+
+def test_fast_structured_translation_does_not_duplicate(monkeypatch):
+    calls = 0
+
+    async def translate_segments(
+        segments,
+        source_language,
+        _target_language,
+        _context,
+        *,
+        require_complete,
+    ):
+        nonlocal calls
+        calls += 1
+        return SegmentTranslationResult(
+            source_language=source_language,
+            translations={segment_id: "译文" for segment_id in segments},
+            provider="provider",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(main_module, "TEXT_MODEL_HEDGE_DELAY_SECONDS", 0.05)
+    monkeypatch.setattr(
+        main_module.database,
+        "find_matching_knowledge",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        main_module.translator, "translate_segments", translate_segments
+    )
+    batch = [
+        DocumentSegment(
+            segment_id="pdf:p1:u1",
+            page_number=1,
+            text="source",
+            source_kind="paragraph",
+            bbox=(0, 0, 10, 10),
+            metadata={},
+        )
+    ]
+
+    async def run_batch():
+        await main_module._translate_document_segment_batch(
+            batch,
+            "en",
+            "zh",
+            "",
+            asyncio.Semaphore(2),
+        )
+
+    asyncio.run(run_batch())
+
+    assert calls == 1
+
+
+def test_partial_slow_translation_does_not_cancel_complete_hedge(monkeypatch):
+    calls = 0
+
+    async def translate_segments(
+        segments,
+        source_language,
+        _target_language,
+        _context,
+        *,
+        require_complete,
+    ):
+        nonlocal calls
+        calls += 1
+        call_number = calls
+        await asyncio.sleep(0.02)
+        segment_ids = list(segments)
+        returned_ids = segment_ids[:1] if call_number == 1 else segment_ids
+        return SegmentTranslationResult(
+            source_language=source_language,
+            translations={segment_id: "译文" for segment_id in returned_ids},
+            provider=f"provider-{call_number}",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(main_module, "TEXT_MODEL_HEDGE_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(
+        main_module.database,
+        "find_matching_knowledge",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        main_module.translator, "translate_segments", translate_segments
+    )
+    batch = [
+        DocumentSegment(
+            segment_id=f"pdf:p1:u{index}",
+            page_number=1,
+            text=f"source {index}",
+            source_kind="paragraph",
+            bbox=(0, 0, 10, 10),
+            metadata={},
+        )
+        for index in (1, 2)
+    ]
+
+    async def run_batch():
+        return await main_module._translate_document_segment_batch(
+            batch,
+            "en",
+            "zh",
+            "",
+            asyncio.Semaphore(2),
+        )
+
+    translations, providers, _warnings = asyncio.run(run_batch())
+
+    assert set(translations) == {"pdf:p1:u1", "pdf:p1:u2"}
+    assert providers == ["provider-2"]
+    assert calls == 2
+
+
 def make_pdf(page_texts, *, image_only=False):
     document = fitz.open()
     try:
@@ -206,6 +440,29 @@ def test_indexed_source_reader_can_return_confirmed_rows_for_compact_retry():
                 b"image", "image/png", ["ID001", "ID002"]
             )
         )
+
+
+def test_grouped_indexed_source_reader_validates_global_ids():
+    service = TranslationService(replace(settings, ai_provider="demo", openai_api_key=""))
+    service.provider = AsyncMock()
+    service.provider.read_indexed_image_line_group.return_value = (
+        [
+            {"id": "ID0001", "source_text": "ผนัง"},
+            {"id": "ID0002", "source_text": "ประตู"},
+        ],
+        "vision",
+    )
+
+    items, route = asyncio.run(
+        service.read_indexed_image_line_group(
+            [b"sheet-1", b"sheet-2"],
+            "image/png",
+            ["ID0001", "ID0002"],
+        )
+    )
+
+    assert route == "vision"
+    assert [item["id"] for item in items] == ["ID0001", "ID0002"]
 
 
 def test_text_translation_accepts_request_context_and_saves_history():
@@ -1505,7 +1762,8 @@ def test_layout_segment_translation_reports_each_completed_batch(monkeypatch):
     assert warnings[0] == "文案按最多 5 页分为 2 个请求"
 
 
-def test_dense_cad_text_batches_keep_full_page_context(monkeypatch):
+@pytest.mark.parametrize("segment_count", [60, 208])
+def test_dense_cad_text_batches_keep_full_page_context(monkeypatch, segment_count):
     calls = []
     segments = [
         DocumentSegment(
@@ -1514,7 +1772,7 @@ def test_dense_cad_text_batches_keep_full_page_context(monkeypatch):
             text=f"อาคาร {index}",
             source_kind="outline-text",
         )
-        for index in range(1, 209)
+        for index in range(1, segment_count + 1)
     ]
 
     async def fake_translate_segments(values, source_language, target_language, context, **_kwargs):
@@ -1540,11 +1798,18 @@ def test_dense_cad_text_batches_keep_full_page_context(monkeypatch):
         main_module._translate_document_segments(segments, "th", "zh", "")
     )
 
-    assert len(calls) == 4
-    assert all(len(values) <= main_module.CAD_PARALLEL_TEXT_BATCH_ITEMS for values, _ in calls)
+    expected_batch_items = (
+        main_module.CAD_BALANCED_TEXT_BATCH_ITEMS
+        if segment_count <= main_module.CAD_BALANCED_TEXT_BATCH_MAX_PAGE_ITEMS
+        else main_module.CAD_PARALLEL_TEXT_BATCH_ITEMS
+    )
+    assert len(calls) == (
+        len(segments) + expected_batch_items - 1
+    ) // expected_batch_items
+    assert all(len(values) <= expected_batch_items for values, _ in calls)
     assert all(
         "[cad:p1:source:001] อาคาร 1" in context
-        and "[cad:p1:source:208] อาคาร 208" in context
+        and f"[cad:p1:source:{segment_count:03d}] อาคาร {segment_count}" in context
         for _, context in calls
     )
     assert len(translations) == len(segments)
@@ -1825,6 +2090,7 @@ def test_document_job_reports_progress_and_returns_result():
             time.sleep(0.01)
 
     assert job["status"] == "completed"
+    assert job["stage"] == "completed"
     assert job["completed_pages"] == 2
     assert job["progress"] == 100
     assert job["message"] == "翻译完成"
@@ -1901,6 +2167,75 @@ def test_pdf_pipeline_starts_translation_before_remaining_pages_are_parsed(
     assert source_text.count("【第") == 6
     assert result.translated_text.count("translated: Page") == 6
     assert result.provider == "fake:layout"
+
+
+def test_pdf_pipeline_uses_prepared_source_from_streaming_parser(monkeypatch):
+    prepared = b"prepared-pdf"
+
+    def fake_iter_pdf_pages(_content, _source_language, prepared_callback):
+        yield ParsedPdfPage(
+            page_number=1,
+            text="English",
+            segments=[
+                DocumentSegment(
+                    segment_id="pdf:p1:s1:o1:t0",
+                    page_number=1,
+                    text="English",
+                    metadata={
+                        "engine": "content-stream",
+                        "native_pdf_version": 4,
+                        "code_refs": [
+                            {
+                                "stream_xref": 1,
+                                "operation_index": 1,
+                                "array_index": -1,
+                                "token_index": 0,
+                            }
+                        ],
+                    },
+                )
+            ],
+        )
+        prepared_callback(prepared)
+
+    async def fake_translate_segments(
+        values, source_language, target_language, context, **_kwargs
+    ):
+        return SegmentTranslationResult(
+            source_language=source_language,
+            translations={key: "英译" for key in values},
+            provider="fake",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(main_module, "iter_pdf_pages", fake_iter_pdf_pages)
+    monkeypatch.setattr(
+        main_module,
+        "prepare_native_pdf_source",
+        lambda *_args: pytest.fail("不应重复解析已准备的 PDF"),
+    )
+    monkeypatch.setattr(
+        main_module.database, "find_exact_knowledge_many", lambda *args: {}
+    )
+    monkeypatch.setattr(
+        main_module.database, "find_matching_knowledge", lambda *args, **kwargs: []
+    )
+    monkeypatch.setattr(
+        main_module.translator, "translate_segments", fake_translate_segments
+    )
+
+    _, result = asyncio.run(
+        main_module._translate_pdf_document_pipeline(
+            b"pdf",
+            "stream.pdf",
+            1,
+            "en",
+            "zh",
+            "",
+        )
+    )
+
+    assert result.prepared_pdf_content == prepared
 
 
 def test_pdf_pipeline_uses_the_same_five_page_batches(monkeypatch):
@@ -2390,6 +2725,78 @@ def test_openai_indexed_image_prompt_marks_ocr_hints_as_noisy():
     assert items[0]["translated_text"] == "墙体"
 
 
+def test_openai_grouped_indexed_reader_keeps_each_image_at_high_detail():
+    provider = OpenAIProvider(settings)
+    provider._generate_with_images = AsyncMock(
+        return_value=(
+            '{"items":[{"id":"ID0001","source_text":"ผนัง"},'
+            '{"id":"ID0002","source_text":"ประตู"}]}',
+            "openai:responses",
+        )
+    )
+
+    items, _ = asyncio.run(
+        provider.read_indexed_image_line_group(
+            [b"sheet-1", b"sheet-2"],
+            "image/png",
+            "",
+            expected_sources={"ID0001": "ผ นั ง"},
+        )
+    )
+
+    call = provider._generate_with_images.await_args
+    assert len(call.args[1]) == 2
+    assert call.kwargs["detail"] == "high"
+    assert "全局唯一" in call.args[0]
+    assert [item["id"] for item in items] == ["ID0001", "ID0002"]
+
+
+def test_openai_provider_reuses_and_closes_http_client_per_loop(monkeypatch):
+    clients = []
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.is_closed = False
+            self.posts = []
+            clients.append(self)
+
+        async def post(self, url, **kwargs):
+            self.posts.append((url, kwargs))
+            return httpx.Response(200, json={"output_text": "ok"})
+
+        async def aclose(self):
+            self.is_closed = True
+
+    monkeypatch.setattr(
+        "app.services.translator.httpx.AsyncClient",
+        FakeAsyncClient,
+    )
+    provider = OpenAIProvider(
+        replace(
+            settings,
+            ai_provider="openai",
+            openai_api_key="test-key",
+            openai_base_url="https://gateway.example/v1",
+        )
+    )
+
+    async def exercise_provider():
+        await provider._post("/responses", {"input": "one"})
+        await provider._post("/responses", {"input": "two"})
+        assert len(clients) == 1
+        assert len(clients[0].posts) == 2
+        assert clients[0].kwargs["trust_env"] is False
+        assert clients[0].kwargs["limits"].max_connections >= 4
+        await provider.aclose()
+
+    asyncio.run(exercise_provider())
+
+    assert clients[0].is_closed is True
+    assert provider._clients_by_loop == {}
+    assert provider._semaphores_by_loop == {}
+
+
 def test_cad_source_hint_filter_keeps_words_and_rejects_line_noise():
     assert main_module._cad_source_hint_is_reliable(
         {
@@ -2536,10 +2943,15 @@ def test_indexed_image_translation_accepts_confirmed_non_thai_false_positive():
 
 def test_pdf_pipeline_uses_indexed_gpt_images_for_dense_cad(monkeypatch):
     content = make_pdf(["CAD"])
+    native_segment = DocumentSegment(
+        segment_id="pdf:p1:n1",
+        page_number=1,
+        text="ชื่อโครงการ",
+    )
     page = ParsedPdfPage(
         page_number=1,
-        text="",
-        segments=[],
+        text=native_segment.text,
+        segments=[native_segment],
         page_type="vector",
         profile={"drawing_count": 50_000, "visual_required": True},
     )
@@ -2554,6 +2966,14 @@ def test_pdf_pipeline_uses_indexed_gpt_images_for_dense_cad(monkeypatch):
     monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
     monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter([page]))
     monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(
+        main_module.database, "find_exact_knowledge_many", lambda *_args: {}
+    )
+    monkeypatch.setattr(
+        main_module.database,
+        "find_matching_knowledge",
+        lambda *_args, **_kwargs: [],
+    )
     monkeypatch.setattr(
         main_module,
         "prepare_dense_cad_translation_sheets",
@@ -2595,19 +3015,44 @@ def test_pdf_pipeline_uses_indexed_gpt_images_for_dense_cad(monkeypatch):
         fake_translate_segments,
     )
 
+    async def fake_translate_native(batch, *_args, **_kwargs):
+        return {batch[0].segment_id: "项目名称"}, ["text"], []
+
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segment_batch",
+        fake_translate_native,
+    )
+
+    progress = []
     source_text, result = asyncio.run(
         main_module._translate_pdf_document_pipeline(
-            content, "cad.pdf", 1, "th", "zh", ""
+            content,
+            "cad.pdf",
+            1,
+            "th",
+            "zh",
+            "",
+            lambda completed, message: progress.append((completed, message)),
         )
     )
 
     assert "ABC อาคาร 123" in source_text
-    assert result.provider == "vision+text:layout"
-    assert result.layout_segments[0]["translated_text"] == "ABC 建筑 123"
-    assert result.layout_segments[0]["metadata"]["ocr_provider"] == "gpt-indexed-source"
+    assert result.provider == "text+vision:layout"
+    visual_segment = next(
+        segment
+        for segment in result.layout_segments
+        if segment.get("metadata", {}).get("ocr_provider") == "gpt-indexed-source"
+    )
+    assert visual_segment["translated_text"] == "ABC 建筑 123"
+    assert all(completed == 0 for completed, _message in progress[:-1])
+    assert any("定位 CAD 文字" in message for _completed, message in progress)
+    assert any("读取 CAD 原文" in message for _completed, message in progress)
+    assert any("复核 CAD 漏检文字" in message for _completed, message in progress)
+    assert any("翻译并回写 CAD 文字" in message for _completed, message in progress)
 
 
-def test_dense_cad_starts_paddle_detection_before_indexed_sheet_build(monkeypatch):
+def test_dense_cad_group_hedges_only_after_primary_is_slow(monkeypatch):
     content = make_pdf(["CAD"])
     page = ParsedPdfPage(
         page_number=1,
@@ -2616,22 +3061,371 @@ def test_dense_cad_starts_paddle_detection_before_indexed_sheet_build(monkeypatc
         page_type="vector",
         profile={"drawing_count": 50_000, "visual_required": True},
     )
-    paddle_started = threading.Event()
-    release_paddle = threading.Event()
+    candidates = [
+        {
+            "bbox": (40.0, 60.0 + index * 30.0, 210.0, 82.0 + index * 30.0),
+            "rotation": 0,
+            "vertical": False,
+            "source_hint": "อาคาร",
+            "source_confidence": 99.0,
+        }
+        for index in range(2)
+    ]
 
     monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
     monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter([page]))
     monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(main_module, "CAD_INDEXED_IMAGES_PER_REQUEST", 2)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_HEDGE_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        lambda *_args, **_kwargs: [
+            {"content": b"one", "entries": {"ID0001": candidates[0]}},
+            {"content": b"two", "entries": {"ID0002": candidates[1]}},
+        ],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    calls = 0
+
+    async def fake_group_reader(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(0.05)
+        return (
+            [
+                {"id": "ID0001", "source_text": "อาคาร 1"},
+                {"id": "ID0002", "source_text": "อาคาร 2"},
+            ],
+            "vision",
+        )
+
+    monkeypatch.setattr(
+        main_module.translator,
+        "read_indexed_image_line_group",
+        fake_group_reader,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
+    )
+
+    source_text, result = asyncio.run(
+        main_module._translate_pdf_document_pipeline(
+            content, "cad.pdf", 1, "th", "zh", ""
+        )
+    )
+
+    assert calls == 2
+    assert "อาคาร 1" in source_text
+    assert len(result.layout_segments) == 2
+
+
+def test_dense_cad_single_sheet_read_uses_same_slow_request_hedge(monkeypatch):
+    content = make_pdf(["CAD"])
+    page = ParsedPdfPage(
+        page_number=1,
+        text="",
+        segments=[],
+        page_type="vector",
+        profile={"drawing_count": 50_000, "visual_required": True},
+    )
+    candidate = {
+        "bbox": (40.0, 60.0, 210.0, 82.0),
+        "rotation": 0,
+        "vertical": False,
+        "source_hint": "อาคาร",
+        "source_confidence": 99.0,
+    }
+    events = []
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter([page]))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(main_module, "CAD_INDEXED_IMAGES_PER_REQUEST", 2)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_MODEL_CONCURRENCY", 2)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_HEDGE_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(
+        main_module,
+        "_log_document_event",
+        lambda event, **details: events.append((event, details)),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        lambda *_args, **_kwargs: [
+            {"content": b"one", "entries": {"ID0001": candidate}}
+        ],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    calls = 0
+
+    async def fake_single_reader(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(0.05)
+        return ([{"id": "ID0001", "source_text": "อาคาร"}], "vision")
+
+    monkeypatch.setattr(
+        main_module.translator,
+        "read_indexed_image_lines",
+        fake_single_reader,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
+    )
+
+    _, result = asyncio.run(
+        main_module._translate_pdf_document_pipeline(
+            content, "cad.pdf", 1, "th", "zh", ""
+        )
+    )
+
+    assert calls == 2
+    assert len(result.layout_segments) == 1
+    assert [
+        details["image_count"]
+        for event, details in events
+        if event == "cad_indexed_vision_hedge_started"
+    ] == [1]
+
+
+def test_dense_cad_group_hedges_when_slot_frees_after_delay(monkeypatch):
+    content = make_pdf(["CAD"])
+    page = ParsedPdfPage(
+        page_number=1,
+        text="",
+        segments=[],
+        page_type="vector",
+        profile={"drawing_count": 50_000, "visual_required": True},
+    )
+    events = []
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter([page]))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(main_module, "CAD_INDEXED_IMAGES_PER_REQUEST", 2)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_MODEL_CONCURRENCY", 2)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_HEDGE_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(
+        main_module,
+        "_log_document_event",
+        lambda event, **details: events.append((event, details)),
+    )
+
+    def candidate(index):
+        return {
+            "bbox": (40.0, 30.0 * index, 210.0, 30.0 * index + 22.0),
+            "rotation": 0,
+            "vertical": False,
+            "source_hint": f"อาคาร {index}",
+            "source_confidence": 99.0,
+        }
+
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        lambda *_args, **_kwargs: [
+            {"content": b"slow-a", "entries": {"ID0001": candidate(1)}},
+            {"content": b"slow-b", "entries": {"ID0002": candidate(2)}},
+            {"content": b"fast-a", "entries": {"ID0003": candidate(3)}},
+            {"content": b"fast-b", "entries": {"ID0004": candidate(4)}},
+        ],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    calls = {"slow": 0, "fast": 0}
+
+    async def fake_group_reader(images, _mime, expected_ids, *_args, **_kwargs):
+        group = "slow" if images[0].startswith(b"slow") else "fast"
+        calls[group] += 1
+        if group == "slow" and calls[group] == 1:
+            await asyncio.sleep(0.08)
+        elif group == "fast":
+            await asyncio.sleep(0.04)
+        return (
+            [
+                {"id": item_id, "source_text": f"อาคาร {item_id}"}
+                for item_id in expected_ids
+            ],
+            "vision",
+        )
+
+    monkeypatch.setattr(
+        main_module.translator,
+        "read_indexed_image_line_group",
+        fake_group_reader,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
+    )
+
+    _, result = asyncio.run(
+        main_module._translate_pdf_document_pipeline(
+            content, "cad.pdf", 1, "th", "zh", ""
+        )
+    )
+
+    assert calls == {"slow": 2, "fast": 1}
+    assert len(result.layout_segments) == 4
+    assert [
+        details["group_number"]
+        for event, details in events
+        if event == "cad_indexed_vision_hedge_started"
+    ] == [1]
+
+
+def test_dense_cad_group_does_not_hedge_while_primary_waits_for_slot(monkeypatch):
+    content = make_pdf(["CAD 1", "CAD 2"])
+    pages = [
+        ParsedPdfPage(
+            page_number=page_number,
+            text="",
+            segments=[],
+            page_type="vector",
+            profile={"drawing_count": 50_000, "visual_required": True},
+        )
+        for page_number in (1, 2)
+    ]
+    events = []
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter(pages))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(main_module, "CAD_INDEXED_IMAGES_PER_REQUEST", 2)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_MODEL_CONCURRENCY", 1)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_HEDGE_DELAY_SECONDS", 0.02)
+    monkeypatch.setattr(
+        main_module,
+        "_log_document_event",
+        lambda event, **details: events.append((event, details)),
+    )
+
+    def fake_prepare(page, *_args, **_kwargs):
+        page_label = "1" if "CAD 1" in page.get_text() else "2"
+        return [
+            {
+                "content": f"page-{page_label}-a".encode(),
+                "entries": {
+                    "ID0001": {
+                        "bbox": (10.0, 10.0, 80.0, 24.0),
+                        "rotation": 0,
+                        "vertical": False,
+                        "source_hint": "อาคาร 1",
+                        "source_confidence": 99.0,
+                    }
+                },
+            },
+            {
+                "content": f"page-{page_label}-b".encode(),
+                "entries": {
+                    "ID0002": {
+                        "bbox": (10.0, 30.0, 80.0, 44.0),
+                        "rotation": 0,
+                        "vertical": False,
+                        "source_hint": "อาคาร 2",
+                        "source_confidence": 99.0,
+                    }
+                },
+            },
+        ]
+
+    monkeypatch.setattr(
+        main_module, "prepare_dense_cad_translation_sheets", fake_prepare
+    )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+
+    async def fake_group_reader(images, *_args, **_kwargs):
+        if images[0].startswith(b"page-1"):
+            await asyncio.sleep(0.08)
+        return (
+            [
+                {"id": "ID0001", "source_text": "อาคาร 1"},
+                {"id": "ID0002", "source_text": "อาคาร 2"},
+            ],
+            "vision",
+        )
+
+    monkeypatch.setattr(
+        main_module.translator,
+        "read_indexed_image_line_group",
+        fake_group_reader,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
+    )
+
+    asyncio.run(
+        main_module._translate_pdf_document_pipeline(
+            content, "cad.pdf", 2, "th", "zh", ""
+        )
+    )
+
+    hedge_pages = [
+        details["page_number"]
+        for event, details in events
+        if event == "cad_indexed_vision_hedge_started"
+    ]
+    assert hedge_pages == []
+
+
+def test_dense_cad_finishes_tesseract_sheet_build_before_paddle_detection(
+    monkeypatch,
+):
+    content = make_pdf(["CAD"])
+    page = ParsedPdfPage(
+        page_number=1,
+        text="",
+        segments=[],
+        page_type="vector",
+        profile={"drawing_count": 50_000, "visual_required": True},
+    )
+    tesseract_finished = threading.Event()
+    page_stream_finished = threading.Event()
+
+    def fake_iter_pages(*_args):
+        yield page
+        page_stream_finished.set()
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", fake_iter_pages)
+    monkeypatch.setattr(main_module.translator, "provider", object())
 
     def fake_detect(*_args, **kwargs):
         assert kwargs["defer_existing_filter"] is True
-        paddle_started.set()
-        assert release_paddle.wait(timeout=2)
+        assert kwargs["selective_recognition"] is True
+        assert kwargs["existing_bboxes"] == []
+        assert tesseract_finished.is_set()
         return []
 
     def fake_prepare(*_args, **_kwargs):
-        assert paddle_started.wait(timeout=2)
-        release_paddle.set()
+        assert page_stream_finished.is_set()
+        assert not tesseract_finished.is_set()
+        tesseract_finished.set()
         return []
 
     monkeypatch.setattr(
@@ -2659,7 +3453,104 @@ def test_dense_cad_starts_paddle_detection_before_indexed_sheet_build(monkeypatc
             content, "cad.pdf", 1, "th", "zh", ""
         )
     )
-    assert paddle_started.is_set()
+    assert tesseract_finished.is_set()
+
+
+def test_dense_cad_reuses_one_paddle_worker_across_pages(monkeypatch):
+    content = make_pdf(["CAD 1", "CAD 2"])
+    pages = [
+        ParsedPdfPage(
+            page_number=page_number,
+            text="",
+            segments=[],
+            page_type="vector",
+            profile={"drawing_count": 50_000, "visual_required": True},
+        )
+        for page_number in (1, 2)
+    ]
+    worker_threads = []
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter(pages))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        lambda *_args, **_kwargs: [],
+    )
+
+    def fake_detect(*_args, **_kwargs):
+        worker_threads.append(threading.get_ident())
+        return []
+
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        fake_detect,
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="没有可翻译的文字"):
+            asyncio.run(
+                main_module._translate_pdf_document_pipeline(
+                    content, "cad.pdf", 2, "th", "zh", ""
+                )
+            )
+
+    assert len(worker_threads) == 4
+    assert len(set(worker_threads)) == 1
+    assert worker_threads[0] != threading.get_ident()
+
+
+def test_dense_cad_serializes_tesseract_sheet_builds_across_pages(monkeypatch):
+    content = make_pdf(["CAD 1", "CAD 2", "CAD 3", "CAD 4"])
+    pages = [
+        ParsedPdfPage(
+            page_number=page_number,
+            text="",
+            segments=[],
+            page_type="vector",
+            profile={"drawing_count": 50_000, "visual_required": True},
+        )
+        for page_number in range(1, 5)
+    ]
+    active_builds = 0
+    maximum_active_builds = 0
+    build_lock = threading.Lock()
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter(pages))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+
+    def fake_prepare(*_args, **_kwargs):
+        nonlocal active_builds, maximum_active_builds
+        with build_lock:
+            active_builds += 1
+            maximum_active_builds = max(maximum_active_builds, active_builds)
+        time.sleep(0.03)
+        with build_lock:
+            active_builds -= 1
+        return []
+
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        fake_prepare,
+    )
+
+    with pytest.raises(RuntimeError, match="没有可翻译的文字"):
+        asyncio.run(
+            main_module._translate_pdf_document_pipeline(
+                content, "cad.pdf", 4, "th", "zh", ""
+            )
+        )
+
+    assert maximum_active_builds == 1
 
 
 def test_dense_cad_pipeline_writes_detected_diagonal_watermark(monkeypatch):

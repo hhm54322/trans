@@ -62,6 +62,51 @@ def _char_origins(content, characters):
         document.close()
 
 
+def test_skips_table_detection_when_page_has_no_mapped_source_units(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.native_pdf._native_pdf_table_cells",
+        lambda _page: pytest.fail("无原生写回单元时不应扫描表格"),
+    )
+    monkeypatch.setattr(
+        "app.services.native_pdf._parse_page_code_tokens",
+        lambda _page: pytest.fail("无源语言字符时不应解析 PDF 内容流"),
+    )
+
+    units, profile = _units(_source_pdf(text="English only"), "th")
+
+    assert units == []
+    assert profile["processable_source_chars"] == 0
+
+
+def test_skips_generic_table_detection_on_dense_vector_page(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.native_pdf.VECTOR_SCAN_DRAWING_THRESHOLD", 1
+    )
+    monkeypatch.setattr(
+        "app.services.native_pdf._native_pdf_table_cells",
+        lambda _page: pytest.fail("CAD 密集矢量页不应扫描通用表格"),
+    )
+
+    units, profile = _units(_source_pdf(), "th")
+
+    assert units
+    assert profile["page_type"] == "vector"
+
+
+def test_keeps_table_detection_for_ordinary_native_page(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "app.services.native_pdf._native_pdf_table_cells",
+        lambda page: calls.append(page.number) or [],
+    )
+
+    units, profile = _units(_source_pdf(), "th")
+
+    assert units
+    assert profile["page_type"] == "native_text"
+    assert calls == [0]
+
+
 def test_merges_adjacent_justified_fragments_on_the_same_baseline():
     def fragment(text, left, right, baseline=100.0, size=12.0, color=0xFFFFFF):
         character_width = (right - left) / len(text)
@@ -476,6 +521,25 @@ def test_prepared_source_produces_the_same_valid_translation():
         assert "ABC 建筑 123" in text
     finally:
         document.close()
+
+
+def test_extractor_reuses_parsed_streams_for_prepared_source():
+    source = _source_pdf()
+    with NativePdfExtractor(source, "th", prepare_source=True) as extractor:
+        pages = list(extractor.iter_pages())
+        cached_prepared = extractor.prepared_pdf_content()
+
+    assert cached_prepared is not None
+    units = pages[0][1]
+    separately_prepared = prepare_native_pdf_source(source, units)
+    cached_document = fitz.open(stream=cached_prepared, filetype="pdf")
+    separate_document = fitz.open(stream=separately_prepared, filetype="pdf")
+    try:
+        assert "อาคาร" not in cached_document[0].get_text("text")
+        assert cached_document[0].get_pixmap().samples == separate_document[0].get_pixmap().samples
+    finally:
+        cached_document.close()
+        separate_document.close()
 
 
 def test_translation_keeps_arbitrary_baseline_direction():

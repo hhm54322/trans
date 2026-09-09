@@ -31,6 +31,7 @@ export interface TranslationOptions {
 export interface DocumentTranslationJob {
   job_id: string
   status: 'processing' | 'completed' | 'failed'
+  stage: string
   completed_pages: number
   total_pages: number
   progress: number

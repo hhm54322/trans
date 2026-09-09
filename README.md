@@ -86,6 +86,18 @@ APP_MAX_DOCUMENT_CHARACTERS=1000000
 APP_PDF_OCR_MAX_PAGES=50
 APP_PDF_OCR_DESIRED_WIDTH=1600
 APP_PDF_OCR_CONCURRENCY=2
+APP_CAD_OCR_MODE=auto
+APP_CAD_INDEXED_IMAGES_PER_REQUEST=2
+APP_CAD_REVIEW_IMAGES_PER_REQUEST=4
+APP_CAD_INDEXED_MODEL_CONCURRENCY=5
+APP_CAD_VISUAL_PAGE_CONCURRENCY=4
+APP_CAD_LOCAL_OCR_CONCURRENCY=1
+APP_CAD_PADDLE_WORKERS=1
+APP_PADDLE_DEVICE=
+APP_PADDLE_CPU_THREADS=
+APP_PADDLE_ENABLE_MKLDNN=false
+APP_CAD_INDEXED_HEDGE_DELAY_SECONDS=25
+APP_TEXT_MODEL_HEDGE_DELAY_SECONDS=60
 APP_EXPORT_FONT_ZH=
 APP_EXPORT_FONT_TH=
 APP_EXPORT_FONT_EN=
@@ -96,7 +108,9 @@ APP_EXPORT_FONT_EN=
 - 文本和图片默认使用同一模型；如网关的视觉模型名称不同，可单独设置 `OPENAI_VISION_MODEL`。
 - `none` 以返回速度和成本为先。上线前应使用真实业务样本对准确率、延迟和费用做基准测试。
 - 文案页每 5 页一个请求，默认最多同时处理 5 个批次；PDF 异步任务会边逐页解析、边提交已形成的批次，并始终按页码合并结果。模型调用也默认全局并发 5。遇到 429 会自动按 `Retry-After` 或指数退避重试，次数和基础等待时间可通过 `OPENAI_MAX_RETRIES`、`OPENAI_RETRY_BASE_SECONDS` 调整。
-- 单个文件默认最大 200 MB。PDF、DOCX、PPTX 默认最多 1,000,000 个字符，并按最多 5 页、10,000 字符和 600 个文字块的组合阈值拆分请求；单次发送的 TXT、Markdown 仍限制为 50,000 字符。扫描 PDF 默认最多 50 页、页面渲染宽度 1600 像素、并发处理 2 页。限制可通过 `APP_MAX_DOCUMENT_CHARACTERS`、`APP_PDF_OCR_MAX_PAGES` 调整。
+- 单个文件默认最大 200 MB。PDF、DOCX、PPTX 默认最多 1,000,000 个字符，并按最多 5 页、6,000 字符和 180 个文字块的组合阈值拆分请求；单次发送的 TXT、Markdown 仍限制为 50,000 字符。扫描 PDF 默认最多 50 页、页面渲染宽度 1600 像素、并发处理 2 页。限制可通过 `APP_MAX_DOCUMENT_CHARACTERS`、`APP_PDF_OCR_MAX_PAGES` 调整。
+- CAD 主索引图默认以 2 张全分辨率图合并为一次视觉请求；每张仅 3 行的高清复核图则以 4 张合并，失败时自动降级为单图。Tesseract 候选定位始终优先且独占执行；Paddle 漏检复核只在没有定位任务排队时按 `APP_CAD_PADDLE_WORKERS` 并行。每个 Paddle 工作线都会常驻独立模型，低配服务器保持 1；只在内存和 CPU/GPU 充足的生产机压测后提高。
+- CAD 视觉请求和结构化文本请求分别在 25 秒、60 秒后排队启动延迟对冲，用于吸收网关长尾；已排队的正常请求优先，不会被对冲抢占槽位。可通过对应 `*_HEDGE_DELAY_SECONDS` 设为 0 关闭。
 - 图片 PDF 页每页都会产生一次视觉模型调用，费用和耗时随图片页数增长。文案页每 5 页一个请求并发处理，前端按已完成页数展示实时进度，全部返回后按页码合并结果；个别图片页失败时会返回已完成页面并给出提示。
 - PDF 内容流引擎按所选源语言翻译中文、泰文或英文文字层，保留其他语言、数字、图片、表格线和 CAD 线条；系统字体沿原基线单行回写，过长时只缩小字号，不自动换行。PDF 未排版译文在单个源页内容过长时会自动续页。DOCX 和 PPTX 直接修改源文件中的段落/文本框，保留源包内的版式资源。
 
