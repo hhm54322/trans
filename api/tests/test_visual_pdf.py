@@ -75,6 +75,48 @@ def _outline_segment(text="ABC อาคาร 123", translated="ABC 建筑 123"
     }
 
 
+def test_repack_indexed_translation_sheets_fills_sparse_png_rows_losslessly():
+    row_height = 4
+
+    def sheet(prefix, values):
+        image = np.concatenate(
+            [np.full((row_height, 8, 3), value, dtype=np.uint8) for value in values],
+            axis=0,
+        )
+        ok, encoded = cv2.imencode(".png", image)
+        assert ok
+        return {
+            "content": encoded.tobytes(),
+            "entries": {
+                f"{prefix}{index}": {"sheet_row": index}
+                for index in range(len(values))
+            },
+            "row_height": row_height,
+            "label_width": 2,
+            "focused_review": True,
+        }
+
+    first = sheet("A", [10, 20, 30])
+    second = sheet("B", [40, 50, 60])
+    packed = visual_pdf.repack_indexed_translation_sheets(
+        [(first, ["A0", "A2"]), (second, ["B0", "B1", "B2"])]
+    )
+
+    assert [list(item["entries"]) for item in packed] == [
+        ["A0", "A2", "B0"],
+        ["B1", "B2"],
+    ]
+    assert all(item["focused_review"] for item in packed)
+    observed = []
+    for item in packed:
+        image = cv2.imdecode(np.frombuffer(item["content"], np.uint8), cv2.IMREAD_COLOR)
+        for row_index, candidate in enumerate(item["entries"].values()):
+            assert candidate["sheet_row"] == row_index
+            row = image[row_index * row_height : (row_index + 1) * row_height]
+            observed.append(int(row[0, 0, 0]))
+    assert observed == [10, 30, 40, 50, 60]
+
+
 def _text_spans(content):
     document = fitz.open(stream=content, filetype="pdf")
     try:

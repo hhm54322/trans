@@ -70,6 +70,7 @@ from .services.visual_pdf import (
     render_dense_cad_page_png,
     recover_dense_cad_review_text_lines,
     recognize_indexed_sheet_rows,
+    repack_indexed_translation_sheets,
     requires_deep_table_ocr,
     subset_indexed_translation_sheet,
 )
@@ -359,6 +360,7 @@ class _CadVisualSourceCache:
         duplicate_rows = []
         waiting_rows = []
         owner_rows = []
+        selected_sheets = []
         original_count = 0
         sent_count = 0
         seen_keys = set()
@@ -395,11 +397,16 @@ class _CadVisualSourceCache:
                 if not selected_ids:
                     continue
                 sent_count += len(selected_ids)
-                reduced_sheets.append(
-                    sheet
-                    if len(selected_ids) == len(entries)
-                    else subset_indexed_translation_sheet(sheet, selected_ids)
-                )
+                selected_sheets.append((sheet, selected_ids))
+
+        if sent_count == original_count:
+            reduced_sheets = [sheet for sheet, _ids in selected_sheets]
+        elif selected_sheets:
+            reduced_sheets = await loop.run_in_executor(
+                None,
+                repack_indexed_translation_sheets,
+                selected_sheets,
+            )
 
         owner_task = asyncio.current_task()
         if owner_rows and owner_task is not None:
@@ -423,6 +430,8 @@ class _CadVisualSourceCache:
                 "cache_hit_count": len(cached_rows),
                 "duplicate_count": len(duplicate_rows),
                 "coalesced_count": len(waiting_rows),
+                "original_sheet_count": len(sheets),
+                "sent_sheet_count": len(reduced_sheets),
             },
         )
 

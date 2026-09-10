@@ -1480,6 +1480,91 @@ def subset_indexed_translation_sheet(
     }
 
 
+def repack_indexed_translation_sheets(
+    selections: Sequence[Tuple[Dict[str, Any], Sequence[str]]],
+) -> List[Dict[str, Any]]:
+    """Pack selected indexed rows densely without resampling their pixels.
+
+    Exact-cache removal can leave one or two rows in many three-row sheets.
+    Sending those sparse images wastes model calls.  This helper decodes the
+    lossless PNGs, copies complete source rows byte-for-byte in pixel space,
+    and repacks compatible rows to the original per-sheet capacity.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("CAD 索引图运行环境不完整") from exc
+
+    compatible_groups: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for sheet, item_ids in selections:
+        entries = sheet.get("entries") or {}
+        selected = [item_id for item_id in item_ids if item_id in entries]
+        if not selected:
+            continue
+        image = cv2.imdecode(
+            np.frombuffer(sheet.get("content") or b"", dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        if image is None:
+            raise RuntimeError("CAD 索引图无法生成紧凑图")
+        row_height = int(sheet.get("row_height") or 80)
+        signature = (
+            row_height,
+            image.shape[1],
+            int(sheet.get("label_width") or 110),
+            bool(sheet.get("focused_review")),
+            bool(sheet.get("wide_context")),
+        )
+        group = compatible_groups.setdefault(
+            signature,
+            {
+                "capacity": len(entries),
+                "rows": [],
+            },
+        )
+        group["capacity"] = max(group["capacity"], len(entries))
+        for item_id in selected:
+            candidate = entries[item_id]
+            source_row = int(candidate.get("sheet_row") or 0)
+            y0 = source_row * row_height
+            y1 = min(image.shape[0], y0 + row_height)
+            if y1 <= y0:
+                continue
+            group["rows"].append((item_id, candidate, image[y0:y1].copy()))
+
+    packed_sheets = []
+    for signature, group in compatible_groups.items():
+        row_height, _width, label_width, focused_review, wide_context = signature
+        capacity = max(1, int(group["capacity"]))
+        rows = group["rows"]
+        for offset in range(0, len(rows), capacity):
+            packed = rows[offset : offset + capacity]
+            packed_image = np.concatenate([row[2] for row in packed], axis=0)
+            packed_entries = {}
+            for sheet_row, (item_id, candidate, _pixels) in enumerate(packed):
+                if item_id in packed_entries:
+                    raise RuntimeError("CAD 索引图 ID 重复，无法重新打包")
+                packed_candidate = dict(candidate)
+                packed_candidate["sheet_row"] = sheet_row
+                packed_entries[item_id] = packed_candidate
+            ok, encoded = _encode_cad_png(packed_image)
+            if not ok:
+                raise RuntimeError("CAD 索引图无法生成紧凑图")
+            output = {
+                "content": encoded.tobytes(),
+                "entries": packed_entries,
+                "row_height": row_height,
+                "label_width": label_width,
+            }
+            if focused_review:
+                output["focused_review"] = True
+            if wide_context:
+                output["wide_context"] = True
+            packed_sheets.append(output)
+    return packed_sheets
+
+
 def detect_dense_cad_paddle_candidates(
     page,
     *,
