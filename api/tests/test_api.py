@@ -3424,6 +3424,103 @@ def test_dense_cad_group_hedges_only_after_primary_is_slow(monkeypatch):
     assert len(result.layout_segments) == 2
 
 
+def test_dense_cad_large_group_failure_splits_before_single_sheet_fallback(
+    monkeypatch,
+):
+    content = make_pdf(["CAD"])
+    page = ParsedPdfPage(
+        page_number=1,
+        text="",
+        segments=[],
+        page_type="vector",
+        profile={"drawing_count": 50_000, "visual_required": True},
+    )
+    candidates = [
+        {
+            "bbox": (40.0, 30.0 * index, 210.0, 30.0 * index + 22.0),
+            "rotation": 0,
+            "vertical": False,
+            "source_hint": f"อาคาร {index}",
+            "source_confidence": 99.0,
+        }
+        for index in range(1, 7)
+    ]
+    events = []
+    group_sizes = []
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter([page]))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(main_module, "CAD_INDEXED_IMAGES_PER_REQUEST", 6)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_HEDGE_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        main_module,
+        "_log_document_event",
+        lambda event, **details: events.append((event, details)),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        lambda *_args, **_kwargs: [
+            {
+                "content": f"sheet-{index}".encode(),
+                "entries": {f"ID{index:04d}": candidate},
+            }
+            for index, candidate in enumerate(candidates, start=1)
+        ],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+
+    async def fake_group_reader(images, _mime, expected_ids, *_args, **_kwargs):
+        group_sizes.append(len(images))
+        if len(images) == 6:
+            raise RuntimeError("gateway timeout")
+        return (
+            [
+                {"id": item_id, "source_text": f"อาคาร {item_id}"}
+                for item_id in expected_ids
+            ],
+            "vision",
+        )
+
+    monkeypatch.setattr(
+        main_module.translator,
+        "read_indexed_image_line_group",
+        fake_group_reader,
+    )
+    monkeypatch.setattr(
+        main_module.translator,
+        "read_indexed_image_lines",
+        AsyncMock(side_effect=AssertionError("unexpected single-sheet fallback")),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
+    )
+
+    _, result = asyncio.run(
+        main_module._translate_pdf_document_pipeline(
+            content, "cad.pdf", 1, "th", "zh", ""
+        )
+    )
+
+    assert group_sizes == [6, 3, 3]
+    assert len(result.layout_segments) == 6
+    completion_events = [
+        details
+        for event, details in events
+        if event == "cad_indexed_vision_group_completed"
+    ]
+    assert len(completion_events) == 1
+    assert completion_events[0]["fallback"] is True
+    assert completion_events[0]["returned_count"] == 6
+
+
 def test_dense_cad_single_sheet_read_uses_same_slow_request_hedge(monkeypatch):
     content = make_pdf(["CAD"])
     page = ParsedPdfPage(

@@ -112,12 +112,12 @@ CAD_PADDLE_DETECTOR_ROWS_PER_SHEET = 12
 CAD_INDEXED_IMAGES_PER_REQUEST = max(
     1, min(4, int(os.getenv("APP_CAD_INDEXED_IMAGES_PER_REQUEST", "3")))
 )
-# Focused review sheets contain only three enlarged rows. Six separate images
-# expose 18 unchanged rows; missing IDs are still retried as exact row subsets
-# and a rejected multi-image request still falls back to independent sheets.
-# This reduces provider waves without shrinking or recompressing source glyphs.
+# Focused review sheets contain only three enlarged rows. Four images expose
+# 12 unchanged rows without crossing the deployed gateway's long-tail cliff.
+# Missing IDs are retried as exact row subsets and a rejected group is split
+# recursively before the final independent-sheet fallback.
 CAD_REVIEW_IMAGES_PER_REQUEST = max(
-    1, min(8, int(os.getenv("APP_CAD_REVIEW_IMAGES_PER_REQUEST", "6")))
+    1, min(4, int(os.getenv("APP_CAD_REVIEW_IMAGES_PER_REQUEST", "4")))
 )
 # Indexed sheets retain their original rendering density. A request may carry
 # several separate sheets, but no sheet is stitched, resized or recompressed.
@@ -1618,9 +1618,9 @@ async def _translate_pdf_document_pipeline(
                         f"{last_error}"
                     ) from last_error
 
-                # Paddle runs once per CAD page as a leak detector. Existing
-                # rows get a more accurate cover rectangle; only genuinely new
-                # text receives a focused high-resolution visual source read.
+                # Paddle runs once per CAD page as a leak detector. New rows
+                # and rows matching a Tesseract candidate receive a focused
+                # high-resolution visual source read before they are accepted.
                 existing_refs = [
                     (sheet, item_id)
                     for sheet in indexed_sheets
@@ -1640,6 +1640,7 @@ async def _translate_pdf_document_pipeline(
                     *,
                     require_complete,
                     stage="CAD 原文识别",
+                    emit_completion=True,
                 ):
                     group_started_at = monotonic()
                     if len(numbered_sheets) == 1:
@@ -1652,20 +1653,21 @@ async def _translate_pdf_document_pipeline(
                                 stage=stage,
                             )
                         ]
-                        _log_document_event(
-                            "cad_indexed_vision_group_completed",
-                            filename=filename,
-                            page_number=page_number,
-                            group_number=group_number,
-                            stage=stage,
-                            image_count=1,
-                            expected_count=len(sheet["entries"]),
-                            returned_count=len(single_output[0][1]),
-                            fallback=False,
-                            elapsed_ms=round(
-                                (monotonic() - group_started_at) * 1000
-                            ),
-                        )
+                        if emit_completion:
+                            _log_document_event(
+                                "cad_indexed_vision_group_completed",
+                                filename=filename,
+                                page_number=page_number,
+                                group_number=group_number,
+                                stage=stage,
+                                image_count=1,
+                                expected_count=len(sheet["entries"]),
+                                returned_count=len(single_output[0][1]),
+                                fallback=False,
+                                elapsed_ms=round(
+                                    (monotonic() - group_started_at) * 1000
+                                ),
+                            )
                         return single_output
                     expected_ids = [
                         item_id
@@ -1751,57 +1753,92 @@ async def _translate_pdf_document_pipeline(
                                 if item_id not in by_id
                             ]
                             output.append((sheet, sheet_items, combined_route))
-                        _log_document_event(
-                            "cad_indexed_vision_group_completed",
-                            filename=filename,
-                            page_number=page_number,
-                            group_number=group_number,
-                            stage=stage,
-                            image_count=len(numbered_sheets),
-                            expected_count=len(expected_ids),
-                            returned_count=sum(len(items) for _, items, _ in output),
-                            fallback=False,
-                            elapsed_ms=round(
-                                (monotonic() - group_started_at) * 1000
-                            ),
-                        )
+                        if emit_completion:
+                            _log_document_event(
+                                "cad_indexed_vision_group_completed",
+                                filename=filename,
+                                page_number=page_number,
+                                group_number=group_number,
+                                stage=stage,
+                                image_count=len(numbered_sheets),
+                                expected_count=len(expected_ids),
+                                returned_count=sum(
+                                    len(sheet_items)
+                                    for _, sheet_items, _ in output
+                                ),
+                                fallback=False,
+                                elapsed_ms=round(
+                                    (monotonic() - group_started_at) * 1000
+                                ),
+                            )
                         return output
                     except (asyncio.TimeoutError, RuntimeError) as exc:
-                        _log_document_event(
-                            "cad_multi_image_group_fallback",
-                            filename=filename,
-                            page_number=page_number,
-                            group_number=group_number,
-                            image_count=len(numbered_sheets),
-                            error_type=type(exc).__name__,
-                        )
-                        fallback_output = await asyncio.gather(
-                            *(
-                                read_indexed_sheet(
-                                    sheet_number,
-                                    sheet,
+                        if emit_completion:
+                            _log_document_event(
+                                "cad_multi_image_group_fallback",
+                                filename=filename,
+                                page_number=page_number,
+                                group_number=group_number,
+                                image_count=len(numbered_sheets),
+                                error_type=type(exc).__name__,
+                            )
+                        if len(numbered_sheets) > 2:
+                            # A timed-out six-image request usually succeeds as
+                            # two three-image requests. Split recursively before
+                            # falling all the way back to one request per sheet;
+                            # source pixels and completeness checks are unchanged.
+                            midpoint = (len(numbered_sheets) + 1) // 2
+                            fallback_groups = await asyncio.gather(
+                                read_indexed_sheet_group(
+                                    group_number,
+                                    numbered_sheets[:midpoint],
                                     require_complete=require_complete,
                                     stage=stage,
+                                    emit_completion=False,
+                                ),
+                                read_indexed_sheet_group(
+                                    group_number,
+                                    numbered_sheets[midpoint:],
+                                    require_complete=require_complete,
+                                    stage=stage,
+                                    emit_completion=False,
                                 )
-                                for sheet_number, sheet in numbered_sheets
                             )
-                        )
-                        _log_document_event(
-                            "cad_indexed_vision_group_completed",
-                            filename=filename,
-                            page_number=page_number,
-                            group_number=group_number,
-                            stage=stage,
-                            image_count=len(numbered_sheets),
-                            expected_count=len(expected_ids),
-                            returned_count=sum(
-                                len(items) for _, items, _ in fallback_output
-                            ),
-                            fallback=True,
-                            elapsed_ms=round(
-                                (monotonic() - group_started_at) * 1000
-                            ),
-                        )
+                            fallback_output = [
+                                result
+                                for fallback_group in fallback_groups
+                                for result in fallback_group
+                            ]
+                        else:
+                            fallback_output = await asyncio.gather(
+                                *(
+                                    read_indexed_sheet(
+                                        sheet_number,
+                                        sheet,
+                                        require_complete=require_complete,
+                                        stage=stage,
+                                    )
+                                    for sheet_number, sheet in numbered_sheets
+                                )
+                            )
+                        if emit_completion:
+                            _log_document_event(
+                                "cad_indexed_vision_group_completed",
+                                filename=filename,
+                                page_number=page_number,
+                                group_number=group_number,
+                                stage=stage,
+                                image_count=len(numbered_sheets),
+                                expected_count=len(expected_ids),
+                                returned_count=sum(
+                                    len(sheet_items)
+                                    for _, sheet_items, _ in fallback_output
+                                ),
+                                fallback=True,
+                                elapsed_ms=round(
+                                    (monotonic() - group_started_at) * 1000
+                                ),
+                            )
                         return fallback_output
 
                 numbered_sheets = list(
