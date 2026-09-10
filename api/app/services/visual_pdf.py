@@ -3781,7 +3781,12 @@ def build_visual_pdf_export(
                 text_shape.commit(overlay=True)
             for segment in diagonal_watermarks:
                 _replace_diagonal_watermark(page, segment, font_path)
-        output = document.tobytes(garbage=4, deflate=True)
+        # Level 4 scans and compares every PDF stream looking for duplicates.
+        # Large CAD drawings contain tens of thousands of distinct vector
+        # streams, so that scan can take minutes while saving almost no space.
+        # Level 2 still removes unreachable objects and compacts the xref table;
+        # it changes neither page content nor image/text quality.
+        output = document.tobytes(garbage=2, deflate=True)
     finally:
         document.close()
         if temporary_font_path is not None:

@@ -106,7 +106,19 @@ def _run(arguments: argparse.Namespace) -> Dict[str, Any]:
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"线上任务 {job_id} 超过基准超时")
             time.sleep(arguments.poll_seconds)
-            response = client.get(f"/api/translate/document/jobs/{job_id}")
+            try:
+                response = client.get(f"/api/translate/document/jobs/{job_id}")
+            except httpx.TimeoutException as exc:
+                # Final PDF assembly can briefly keep a large CAD worker busy.
+                # A lost status poll must not discard hours of benchmark data
+                # after the server has already completed the translation.
+                print(
+                    f"状态轮询暂时超时，继续等待任务 {job_id}: "
+                    f"{type(exc).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             response.raise_for_status()
             job = response.json()
             snapshot = _snapshot(job, time.monotonic() - started_at)
