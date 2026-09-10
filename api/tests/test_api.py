@@ -3521,6 +3521,51 @@ def test_dense_cad_large_group_failure_splits_before_single_sheet_fallback(
     assert completion_events[0]["returned_count"] == 6
 
 
+def test_dense_cad_review_render_is_prestarted_before_locator_finishes(monkeypatch):
+    content = make_pdf(["CAD"])
+    page = ParsedPdfPage(
+        page_number=1,
+        text="",
+        segments=[],
+        page_type="vector",
+        profile={"drawing_count": 50_000, "visual_required": True},
+    )
+    render_started = threading.Event()
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter([page]))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(
+        main_module,
+        "render_dense_cad_page_png",
+        lambda *_args, **_kwargs: render_started.set() or b"page",
+    )
+
+    def prepare_after_render_started(*_args, **_kwargs):
+        assert render_started.wait(timeout=2.0)
+        return []
+
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        prepare_after_render_started,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+
+    with pytest.raises(RuntimeError, match="没有可翻译的文字"):
+        asyncio.run(
+            main_module._translate_pdf_document_pipeline(
+                content, "cad.pdf", 1, "th", "zh", ""
+            )
+        )
+
+    assert render_started.is_set()
+
+
 def test_dense_cad_single_sheet_read_uses_same_slow_request_hedge(monkeypatch):
     content = make_pdf(["CAD"])
     page = ParsedPdfPage(

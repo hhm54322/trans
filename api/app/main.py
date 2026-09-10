@@ -1035,6 +1035,11 @@ async def _translate_pdf_document_pipeline(
     visual_page_semaphore = asyncio.Semaphore(
         min(CAD_VISUAL_PAGE_CONCURRENCY, LAYOUT_TRANSLATION_CONCURRENCY)
     )
+    # Every dense CAD page that reaches Paddle review needs the same 6400px
+    # source render. Build one page at a time while local OCR is running so the
+    # expensive render no longer creates a serial gap after detection. The
+    # resolution and the downstream crops remain unchanged.
+    cad_review_render_semaphore = asyncio.Semaphore(1)
     # These caches live for one uploaded document only. Reuse therefore cannot
     # leak terminology or OCR decisions between customers. Vision reuse also
     # requires a matching glyph fingerprint and local Thai OCR hint.
@@ -1211,12 +1216,12 @@ async def _translate_pdf_document_pipeline(
                         0,
                         f"正在流水线定位 CAD 文字（第 {page_number} 页）",
                     )
-                review_page_png_future = None
+                review_page_png_task = None
 
-                async def get_review_page_png():
-                    """Render the exact 6400px review page at most once."""
-                    nonlocal review_page_png_future
-                    if review_page_png_future is None:
+                async def render_review_page_png_once():
+                    async with cad_review_render_semaphore:
+                        render_started_at = monotonic()
+
                         def render_review_page_png():
                             document = fitz.open(stream=content, filetype="pdf")
                             try:
@@ -1229,10 +1234,31 @@ async def _translate_pdf_document_pipeline(
                             finally:
                                 document.close()
 
-                        review_page_png_future = loop.run_in_executor(
+                        rendered = await loop.run_in_executor(
                             None, render_review_page_png
                         )
-                    return await asyncio.shield(review_page_png_future)
+                        _log_document_event(
+                            "cad_review_page_render_completed",
+                            filename=filename,
+                            page_number=page_number,
+                            elapsed_ms=round(
+                                (monotonic() - render_started_at) * 1000
+                            ),
+                        )
+                        return rendered
+
+                def start_review_page_png_render():
+                    nonlocal review_page_png_task
+                    if review_page_png_task is None:
+                        review_page_png_task = asyncio.create_task(
+                            render_review_page_png_once()
+                        )
+                    return review_page_png_task
+
+                async def get_review_page_png():
+                    """Render the exact 6400px review page at most once."""
+                    start_review_page_png_render()
+                    return await asyncio.shield(review_page_png_task)
                 # The full-page Paddle pass needs only the PDF page and native
                 # text. Run it beside Tesseract, then apply the unchanged
                 # overlap filter once both candidate sets are available.
@@ -1282,6 +1308,11 @@ async def _translate_pdf_document_pipeline(
                 paddle_supplement_task = asyncio.create_task(
                     locate_raw_paddle_candidates_once()
                 )
+                # Rendering used to begin only after Paddle finished. Start it
+                # now and let the single render lane fill otherwise-idle CPU
+                # time while OCR and native text translation continue.
+                start_review_page_png_render()
+                await asyncio.sleep(0)
 
                 def prepare_sheets():
                     document = fitz.open(stream=content, filetype="pdf")
