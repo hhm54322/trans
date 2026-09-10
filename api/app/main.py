@@ -112,11 +112,12 @@ CAD_PADDLE_DETECTOR_ROWS_PER_SHEET = 12
 CAD_INDEXED_IMAGES_PER_REQUEST = max(
     1, min(4, int(os.getenv("APP_CAD_INDEXED_IMAGES_PER_REQUEST", "3")))
 )
-# Focused review sheets contain only three enlarged rows. Four separate images
-# therefore expose no more targets than one 12-row primary sheet while turning
-# the common 30-candidate leak pass from two gateway waves into one.
+# Focused review sheets contain only three enlarged rows. Six separate images
+# expose 18 unchanged rows; missing IDs are still retried as exact row subsets
+# and a rejected multi-image request still falls back to independent sheets.
+# This reduces provider waves without shrinking or recompressing source glyphs.
 CAD_REVIEW_IMAGES_PER_REQUEST = max(
-    1, min(4, int(os.getenv("APP_CAD_REVIEW_IMAGES_PER_REQUEST", "4")))
+    1, min(8, int(os.getenv("APP_CAD_REVIEW_IMAGES_PER_REQUEST", "6")))
 )
 # Indexed sheets retain their original rendering density. A request may carry
 # several separate sheets, but no sheet is stitched, resized or recompressed.
