@@ -159,7 +159,13 @@ TEXT_MODEL_HEDGE_DELAY_SECONDS = max(
 # Text batches are not the current bottleneck. Keep enough overlap for normal
 # documents without letting text traffic occupy every provider slot while
 # dense CAD visual sheets are in flight.
-LAYOUT_TRANSLATION_CONCURRENCY = min(5, settings.openai_max_concurrency)
+LAYOUT_TRANSLATION_CONCURRENCY = max(
+    1,
+    min(
+        settings.openai_max_concurrency,
+        int(os.getenv("APP_LAYOUT_TRANSLATION_CONCURRENCY", "5")),
+    ),
+)
 DOCUMENT_JOB_TTL_SECONDS = 3600
 KNOWLEDGE_IMPORT_MAX_ROWS = 10000
 KNOWLEDGE_CONTEXT_MAX_CHARACTERS = 4000
