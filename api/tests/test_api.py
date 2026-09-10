@@ -888,6 +888,122 @@ def test_cad_visual_source_cache_never_reuses_without_both_signals(monkeypatch):
     assert details["sent_count"] == 3
 
 
+def test_cad_visual_source_cache_coalesces_concurrent_exact_rows(monkeypatch):
+    async def scenario():
+        cache = main_module._CadVisualSourceCache()
+        first = {
+            "visual_fingerprint": "e" * 64,
+            "source_hint": "ข้อความ",
+            "source_confidence": 91.0,
+        }
+        repeated = dict(first)
+        monkeypatch.setattr(
+            main_module,
+            "subset_indexed_translation_sheet",
+            lambda sheet, ids: {
+                "content": sheet["content"],
+                "entries": {item_id: sheet["entries"][item_id] for item_id in ids},
+            },
+        )
+
+        first_claim = await cache.claim_sheets(
+            [{"content": b"first", "entries": {"A": first}}]
+        )
+        assert list(first_claim[0][0]["entries"]) == ["A"]
+        assert len(first_claim[4]) == 1
+
+        second_claim = await cache.claim_sheets(
+            [{"content": b"second", "entries": {"B": repeated}}]
+        )
+        assert second_claim[0] == []
+        assert len(second_claim[3]) == 1
+        assert second_claim[5]["coalesced_count"] == 1
+
+        await cache.resolve(
+            first_claim[4],
+            [(first, {"id": "A", "source_text": "ข้อความ"})],
+        )
+        resolved, unresolved = await cache.wait(second_claim[3])
+        assert resolved == [(repeated, "ข้อความ")]
+        assert unresolved == []
+
+        third_claim = await cache.claim_sheets(
+            [{"content": b"third", "entries": {"C": dict(first)}}]
+        )
+        assert third_claim[0] == []
+        assert third_claim[1][0][1] == "ข้อความ"
+        assert third_claim[5]["cache_hit_count"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_cad_visual_source_cache_retries_after_owner_cannot_read():
+    async def scenario():
+        cache = main_module._CadVisualSourceCache()
+        first = {
+            "visual_fingerprint": "f" * 64,
+            "source_hint": "อาคาร",
+            "source_confidence": 85.0,
+        }
+        repeated = dict(first)
+        first_claim = await cache.claim_sheets(
+            [{"content": b"first", "entries": {"A": first}}]
+        )
+        second_claim = await cache.claim_sheets(
+            [{"content": b"second", "entries": {"B": repeated}}]
+        )
+
+        await cache.resolve(
+            first_claim[4],
+            [(first, {"id": "A", "source_text": "[NO_TEXT]"})],
+        )
+        resolved, unresolved = await cache.wait(second_claim[3])
+        assert resolved == []
+        assert unresolved == [repeated]
+
+        retry_claim = await cache.claim_sheets(
+            [{"content": b"retry", "entries": {"B": repeated}}]
+        )
+        assert len(retry_claim[0]) == 1
+        assert len(retry_claim[4]) == 1
+        await cache.abandon(retry_claim[4])
+
+    asyncio.run(scenario())
+
+
+def test_cad_visual_source_cache_releases_waiter_when_owner_task_fails():
+    async def scenario():
+        cache = main_module._CadVisualSourceCache()
+        candidate = {
+            "visual_fingerprint": "1" * 64,
+            "source_hint": "ทดสอบ",
+            "source_confidence": 90.0,
+        }
+        claimed = asyncio.Event()
+
+        async def failed_owner():
+            await cache.claim_sheets(
+                [{"content": b"owner", "entries": {"A": candidate}}]
+            )
+            claimed.set()
+            raise RuntimeError("provider failed")
+
+        owner_task = asyncio.create_task(failed_owner())
+        await claimed.wait()
+        waiter_claim = await cache.claim_sheets(
+            [{"content": b"waiter", "entries": {"B": dict(candidate)}}]
+        )
+        assert len(waiter_claim[3]) == 1
+        await asyncio.gather(owner_task, return_exceptions=True)
+        resolved, unresolved = await asyncio.wait_for(
+            cache.wait(waiter_claim[3]), timeout=1
+        )
+        assert resolved == []
+        assert unresolved == [waiter_claim[3][0][0]]
+
+    asyncio.run(scenario())
+
+
 def test_layout_pdf_export_matches_rotated_source_page_orientation():
     source = fitz.open()
     try:
@@ -4142,6 +4258,120 @@ def test_pdf_pipeline_retries_timed_out_cad_high_resolution_review(monkeypatch):
     assert calls == [b"base", b"review", b"review"]
     assert source_text == "อาคาร"
     assert result.layout_segments[0]["translated_text"] == "建筑"
+
+
+def test_pdf_pipeline_coalesces_exact_paddle_rows_across_concurrent_pages(
+    monkeypatch,
+):
+    content = make_pdf(["CAD 1", "CAD 2"])
+    pages = [
+        ParsedPdfPage(
+            page_number=page_number,
+            text="",
+            segments=[],
+            page_type="vector",
+            profile={"drawing_count": 50_000, "visual_required": True},
+        )
+        for page_number in (1, 2)
+    ]
+    candidate_template = {
+        "bbox": (40.0, 60.0, 210.0, 82.0),
+        "rotation": 0,
+        "vertical": False,
+        "source_hint": "อาคาร",
+        "source_confidence": 92.0,
+        "visual_fingerprint": "2" * 64,
+    }
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    prepared_pages = 0
+    both_pages_prepared = asyncio.Event()
+    vision_calls = []
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
+    monkeypatch.setattr(main_module, "CAD_VISUAL_PAGE_CONCURRENCY", 2)
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter(pages))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda page, **_kwargs: [
+            {
+                **candidate_template,
+                "bbox": (
+                    40.0,
+                    60.0 + page.number,
+                    210.0,
+                    82.0 + page.number,
+                ),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "filter_dense_cad_paddle_candidates",
+        lambda candidates, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "render_dense_cad_page_png",
+        lambda *_args, **_kwargs: b"page",
+    )
+
+    def fake_prepare_review(page, candidates, **_kwargs):
+        nonlocal prepared_pages
+        prepared_pages += 1
+        if prepared_pages == 2:
+            loop.call_soon_threadsafe(both_pages_prepared.set)
+        return [
+            {
+                "content": f"review-{page.number}".encode(),
+                "entries": {"RID": candidates[0]},
+                "focused_review": True,
+            }
+        ]
+
+    monkeypatch.setattr(
+        main_module, "prepare_dense_cad_review_sheets", fake_prepare_review
+    )
+
+    async def fake_read_indexed(content, _mime, expected_ids, *_args, **_kwargs):
+        vision_calls.append(content)
+        await both_pages_prepared.wait()
+        return ([{"id": expected_ids[0], "source_text": "อาคาร"}], "vision")
+
+    monkeypatch.setattr(
+        main_module.translator,
+        "read_indexed_image_lines",
+        fake_read_indexed,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        _fake_two_stage_cad_text_translation,
+    )
+
+    try:
+        source_text, result = loop.run_until_complete(
+            main_module._translate_pdf_document_pipeline(
+                content, "cad.pdf", 2, "th", "zh", ""
+            )
+        )
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+    assert len(vision_calls) == 1
+    assert source_text.count("อาคาร") == 2
+    assert [item["translated_text"] for item in result.layout_segments] == [
+        "建筑",
+        "建筑",
+    ]
 
 
 def test_cad_duplicate_fragment_is_covered_by_confirmed_translation():

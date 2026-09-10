@@ -333,6 +333,148 @@ class _CadTextTranslationCache:
                     )
 
 
+class _CadVisualSourceCache:
+    """Coalesce exact CAD glyph reads across concurrent document pages.
+
+    A row is shareable only when the conservative pixel fingerprint and the
+    local Thai OCR hint both match.  A failed/no-text owner publishes ``None``
+    so every waiting page can run its own normal high-resolution review.
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._values: Dict[str, str] = {}
+        self._pending: Dict[str, asyncio.Future] = {}
+
+    @property
+    def values(self) -> Dict[str, str]:
+        return self._values
+
+    def get(self, cache_key: str) -> Optional[str]:
+        return self._values.get(cache_key)
+
+    async def claim_sheets(self, sheets: List[Dict]):
+        reduced_sheets = []
+        cached_rows = []
+        duplicate_rows = []
+        waiting_rows = []
+        owner_rows = []
+        original_count = 0
+        sent_count = 0
+        seen_keys = set()
+
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            for sheet in sheets:
+                entries = sheet.get("entries") or {}
+                original_count += len(entries)
+                selected_ids = []
+                for item_id, candidate in entries.items():
+                    cache_key = _cad_visual_source_cache_key(candidate)
+                    if cache_key:
+                        candidate["source_cache_key"] = cache_key
+                    cached_source = (
+                        self._values.get(cache_key) if cache_key else None
+                    )
+                    if cached_source:
+                        cached_rows.append((candidate, cached_source))
+                        continue
+                    if cache_key and cache_key in seen_keys:
+                        duplicate_rows.append((candidate, cache_key))
+                        continue
+                    if cache_key:
+                        seen_keys.add(cache_key)
+                        pending = self._pending.get(cache_key)
+                        if pending is not None:
+                            waiting_rows.append((candidate, cache_key, pending))
+                            continue
+                        pending = loop.create_future()
+                        self._pending[cache_key] = pending
+                        owner_rows.append((candidate, cache_key))
+                    selected_ids.append(item_id)
+                if not selected_ids:
+                    continue
+                sent_count += len(selected_ids)
+                reduced_sheets.append(
+                    sheet
+                    if len(selected_ids) == len(entries)
+                    else subset_indexed_translation_sheet(sheet, selected_ids)
+                )
+
+        owner_task = asyncio.current_task()
+        if owner_rows and owner_task is not None:
+            # If this page exits before publishing (provider error, job
+            # cancellation, etc.), release other pages instead of leaving
+            # their exact-match futures pending inside ``asyncio.gather``.
+            def release_unpublished_owners(_completed_task):
+                asyncio.create_task(self.abandon(owner_rows))
+
+            owner_task.add_done_callback(release_unpublished_owners)
+
+        return (
+            reduced_sheets,
+            cached_rows,
+            duplicate_rows,
+            waiting_rows,
+            owner_rows,
+            {
+                "original_count": original_count,
+                "sent_count": sent_count,
+                "cache_hit_count": len(cached_rows),
+                "duplicate_count": len(duplicate_rows),
+                "coalesced_count": len(waiting_rows),
+            },
+        )
+
+    async def resolve(self, owner_rows, recognized_rows):
+        recognized_by_key = {}
+        for candidate, item in recognized_rows:
+            cache_key = _cad_visual_source_cache_key(candidate)
+            source_text = str(item.get("source_text") or "").strip()
+            if cache_key and re.search(r"[\u0E00-\u0E7F]", source_text):
+                recognized_by_key[cache_key] = source_text
+
+        async with self._lock:
+            for _candidate, cache_key in owner_rows:
+                source_text = recognized_by_key.get(cache_key)
+                if source_text:
+                    self._values[cache_key] = source_text
+                pending = self._pending.pop(cache_key, None)
+                if pending is not None and not pending.done():
+                    pending.set_result(source_text)
+
+    async def abandon(self, owner_rows):
+        """Release peers after an owner fails without caching a decision."""
+        async with self._lock:
+            for _candidate, cache_key in owner_rows:
+                pending = self._pending.pop(cache_key, None)
+                if pending is not None and not pending.done():
+                    pending.set_result(None)
+
+    async def wait(self, waiting_rows):
+        if not waiting_rows:
+            return [], []
+        values = await asyncio.gather(*(row[2] for row in waiting_rows))
+        resolved_rows = []
+        unresolved_candidates = []
+        for (candidate, _cache_key, _pending), source_text in zip(
+            waiting_rows, values
+        ):
+            if source_text:
+                resolved_rows.append((candidate, source_text))
+            else:
+                unresolved_candidates.append(candidate)
+        return resolved_rows, unresolved_candidates
+
+    async def remember(self, recognized_rows):
+        async with self._lock:
+            for candidate, item in recognized_rows:
+                cache_key = _cad_visual_source_cache_key(candidate)
+                source_text = str(item.get("source_text") or "").strip()
+                if cache_key and re.search(r"[\u0E00-\u0E7F]", source_text):
+                    self._values[cache_key] = source_text
+
+
 _cad_local_ocr_coordinators_by_loop: Dict[int, _CadLocalOcrCoordinator] = {}
 # Process-wide workers retain thread-local Paddle models between documents.
 # The safe default is one because every additional configured worker keeps a
@@ -886,7 +1028,7 @@ async def _translate_pdf_document_pipeline(
     # These caches live for one uploaded document only. Reuse therefore cannot
     # leak terminology or OCR decisions between customers. Vision reuse also
     # requires a matching glyph fingerprint and local Thai OCR hint.
-    cad_confirmed_source_cache: Dict[str, str] = {}
+    cad_visual_source_cache = _CadVisualSourceCache()
     cad_text_translation_cache = _CadTextTranslationCache()
     page_stream_complete = asyncio.Event()
     language_confirmed = asyncio.Event()
@@ -1200,14 +1342,16 @@ async def _translate_pdf_document_pipeline(
                     vision_indexed_sheets,
                     indexed_cached_rows,
                     indexed_duplicate_rows,
+                    indexed_waiting_rows,
+                    indexed_owner_rows,
                     indexed_cache_stats,
-                ) = _compact_cad_sheets_with_source_cache(
+                ) = await cad_visual_source_cache.claim_sheets(
                     indexed_sheets,
-                    cad_confirmed_source_cache,
                 )
                 if (
                     indexed_cache_stats["cache_hit_count"]
                     or indexed_cache_stats["duplicate_count"]
+                    or indexed_cache_stats["coalesced_count"]
                 ):
                     _log_document_event(
                         "cad_visual_source_cache_reused",
@@ -1695,21 +1839,11 @@ async def _translate_pdf_document_pipeline(
                 # confirmed Thai source text. If that representative needs a
                 # high-resolution retry, send the duplicate through the same
                 # conservative review path instead of silently dropping it.
-                recognized_rows = _commit_and_expand_cad_source_cache(
-                    recognized_rows,
-                    [],
-                    [],
-                    cad_confirmed_source_cache,
-                )
-                resolved_indexed_duplicates = []
-                for candidate, cache_key in indexed_duplicate_rows:
-                    if cad_confirmed_source_cache.get(cache_key):
-                        resolved_indexed_duplicates.append((candidate, cache_key))
-                    else:
-                        unresolved_for_review.append(dict(candidate))
-                indexed_duplicate_rows = resolved_indexed_duplicates
+                await cad_visual_source_cache.remember(recognized_rows)
 
-                if unresolved_for_review:
+                async def review_cad_candidates(candidates):
+                    if not candidates:
+                        return []
                     review_page_png = await get_review_page_png()
 
                     def prepare_unresolved_review_sheets():
@@ -1717,7 +1851,7 @@ async def _translate_pdf_document_pipeline(
                         try:
                             return prepare_dense_cad_review_sheets(
                                 document[page_number - 1],
-                                unresolved_for_review,
+                                candidates,
                                 desired_width=6400,
                                 rows_per_sheet=3,
                                 rendered_page_png=review_page_png,
@@ -1763,19 +1897,57 @@ async def _translate_pdf_document_pipeline(
                         for group_results in unresolved_group_results
                         for result in group_results
                     ]
+                    reviewed_rows = []
                     for sheet, items, route in unresolved_results:
                         if route:
                             reader_providers.append(route)
                         for item in items:
-                            recognized_rows.append(
+                            reviewed_rows.append(
                                 (sheet["entries"][item["id"]], item)
                             )
+                    return reviewed_rows
+
+                recognized_rows.extend(
+                    await review_cad_candidates(unresolved_for_review)
+                )
+                await cad_visual_source_cache.resolve(
+                    indexed_owner_rows,
+                    recognized_rows,
+                )
+                (
+                    indexed_coalesced_rows,
+                    indexed_unresolved_waiters,
+                ) = await cad_visual_source_cache.wait(indexed_waiting_rows)
+                if indexed_unresolved_waiters:
+                    waiter_review_rows = await review_cad_candidates(
+                        indexed_unresolved_waiters
+                    )
+                    recognized_rows.extend(waiter_review_rows)
+                    await cad_visual_source_cache.remember(waiter_review_rows)
+                indexed_cached_rows.extend(indexed_coalesced_rows)
+
+                resolved_indexed_duplicates = []
+                unresolved_indexed_duplicates = []
+                for candidate, cache_key in indexed_duplicate_rows:
+                    if cad_visual_source_cache.get(cache_key):
+                        resolved_indexed_duplicates.append((candidate, cache_key))
+                    else:
+                        unresolved_indexed_duplicates.append(
+                            (dict(candidate), cache_key)
+                        )
+                if unresolved_indexed_duplicates:
+                    duplicate_review_rows = await review_cad_candidates(
+                        [candidate for candidate, _ in unresolved_indexed_duplicates]
+                    )
+                    recognized_rows.extend(duplicate_review_rows)
+                    await cad_visual_source_cache.remember(duplicate_review_rows)
+                indexed_duplicate_rows = resolved_indexed_duplicates
 
                 recognized_rows = _commit_and_expand_cad_source_cache(
                     recognized_rows,
                     indexed_cached_rows,
                     indexed_duplicate_rows,
-                    cad_confirmed_source_cache,
+                    cad_visual_source_cache.values,
                 )
 
                 if progress_callback:
@@ -1836,14 +2008,16 @@ async def _translate_pdf_document_pipeline(
                         vision_paddle_sheets,
                         paddle_cached_rows,
                         paddle_duplicate_rows,
+                        paddle_waiting_rows,
+                        paddle_owner_rows,
                         paddle_cache_stats,
-                    ) = _compact_cad_sheets_with_source_cache(
+                    ) = await cad_visual_source_cache.claim_sheets(
                         [sheet for sheet in paddle_sheets if sheet.get("entries")],
-                        cad_confirmed_source_cache,
                     )
                     if (
                         paddle_cache_stats["cache_hit_count"]
                         or paddle_cache_stats["duplicate_count"]
+                        or paddle_cache_stats["coalesced_count"]
                     ):
                         _log_document_event(
                             "cad_visual_source_cache_reused",
@@ -1894,12 +2068,27 @@ async def _translate_pdf_document_pipeline(
                             paddle_recognized_rows.append(
                                 (sheet["entries"][item["id"]], item)
                             )
+                    await cad_visual_source_cache.resolve(
+                        paddle_owner_rows,
+                        paddle_recognized_rows,
+                    )
+                    (
+                        paddle_coalesced_rows,
+                        paddle_unresolved_waiters,
+                    ) = await cad_visual_source_cache.wait(paddle_waiting_rows)
+                    if paddle_unresolved_waiters:
+                        waiter_review_rows = await review_cad_candidates(
+                            paddle_unresolved_waiters
+                        )
+                        paddle_recognized_rows.extend(waiter_review_rows)
+                        await cad_visual_source_cache.remember(waiter_review_rows)
+                    paddle_cached_rows.extend(paddle_coalesced_rows)
                     recognized_rows.extend(
                         _commit_and_expand_cad_source_cache(
                             paddle_recognized_rows,
                             paddle_cached_rows,
                             paddle_duplicate_rows,
-                            cad_confirmed_source_cache,
+                            cad_visual_source_cache.values,
                         )
                     )
 
