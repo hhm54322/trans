@@ -146,6 +146,10 @@ CAD_INDEXED_HEDGE_DELAY_SECONDS = max(
     0.0,
     float(os.getenv("APP_CAD_INDEXED_HEDGE_DELAY_SECONDS", "25")),
 )
+CAD_INDEXED_HEDGE_CONCURRENCY = max(
+    0,
+    min(2, int(os.getenv("APP_CAD_INDEXED_HEDGE_CONCURRENCY", "1"))),
+)
 TEXT_MODEL_HEDGE_DELAY_SECONDS = max(
     0.0,
     float(os.getenv("APP_TEXT_MODEL_HEDGE_DELAY_SECONDS", "60")),
@@ -260,6 +264,73 @@ class _CadLocalOcrCoordinator:
             async with self._condition:
                 self._active_paddles -= 1
                 self._condition.notify_all()
+
+
+class _CadTextTranslationCache:
+    """Coalesce identical CAD text translations within one document job."""
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._values: Dict[str, str] = {}
+        self._pending: Dict[str, asyncio.Future] = {}
+
+    @staticmethod
+    def key(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip())
+
+    async def claim(self, segments: List[DocumentSegment]):
+        owners = []
+        owner_keys = {}
+        cached = {}
+        waiters = {}
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            for segment in segments:
+                cache_key = self.key(segment.text)
+                if cache_key in self._values:
+                    cached[segment.segment_id] = self._values[cache_key]
+                    continue
+                pending = self._pending.get(cache_key)
+                if pending is not None:
+                    waiters[segment.segment_id] = pending
+                    continue
+                pending = loop.create_future()
+                self._pending[cache_key] = pending
+                owners.append(segment)
+                owner_keys[segment.segment_id] = cache_key
+        return owners, owner_keys, cached, waiters
+
+    async def resolve(self, owner_keys: Dict[str, str], translations: Dict[str, str]):
+        async with self._lock:
+            missing_segment_ids = [
+                segment_id
+                for segment_id in owner_keys
+                if segment_id not in translations
+            ]
+            if missing_segment_ids:
+                raise RuntimeError(
+                    "ID_MISMATCH: CAD 文档缓存缺少已请求的译文"
+                )
+            for segment_id, cache_key in owner_keys.items():
+                translated = translations[segment_id]
+                self._values[cache_key] = translated
+                pending = self._pending.pop(cache_key, None)
+                if pending is not None and not pending.done():
+                    pending.set_result(translated)
+
+    async def fail(self, owner_keys: Dict[str, str], error: BaseException):
+        async with self._lock:
+            for cache_key in owner_keys.values():
+                pending = self._pending.pop(cache_key, None)
+                if pending is not None and not pending.done():
+                    pending.set_exception(error)
+                    # Retrieve owner-only failures while preserving the same
+                    # exception for any page already awaiting this future.
+                    pending.add_done_callback(
+                        lambda future: future.exception()
+                        if not future.cancelled()
+                        else None
+                    )
 
 
 _cad_local_ocr_coordinators_by_loop: Dict[int, _CadLocalOcrCoordinator] = {}
@@ -800,6 +871,7 @@ async def _translate_pdf_document_pipeline(
     cad_vision_semaphore = asyncio.Semaphore(
         min(CAD_INDEXED_MODEL_CONCURRENCY, LAYOUT_TRANSLATION_CONCURRENCY)
     )
+    cad_hedge_semaphore = asyncio.Semaphore(CAD_INDEXED_HEDGE_CONCURRENCY)
     # Candidate location is the quality gate. It remains exclusive and takes
     # priority over Paddle so inference cannot starve Tesseract and silently
     # reduce recall. Once no locator is waiting, configured production workers
@@ -811,6 +883,11 @@ async def _translate_pdf_document_pipeline(
     visual_page_semaphore = asyncio.Semaphore(
         min(CAD_VISUAL_PAGE_CONCURRENCY, LAYOUT_TRANSLATION_CONCURRENCY)
     )
+    # These caches live for one uploaded document only. Reuse therefore cannot
+    # leak terminology or OCR decisions between customers. Vision reuse also
+    # requires a matching glyph fingerprint and local Thai OCR hint.
+    cad_confirmed_source_cache: Dict[str, str] = {}
+    cad_text_translation_cache = _CadTextTranslationCache()
     page_stream_complete = asyncio.Event()
     language_confirmed = asyncio.Event()
     provisional_language = source_language if source_language != "auto" else None
@@ -1005,8 +1082,8 @@ async def _translate_pdf_document_pipeline(
                         )
                     return await asyncio.shield(review_page_png_future)
                 # The full-page Paddle pass needs only the PDF page and native
-                # text. It is scheduled after Tesseract below, then merged
-                # through the unchanged overlap filter.
+                # text. Run it beside Tesseract, then apply the unchanged
+                # overlap filter once both candidate sets are available.
                 def locate_raw_paddle_candidates():
                     document = fitz.open(stream=content, filetype="pdf")
                     try:
@@ -1014,9 +1091,9 @@ async def _translate_pdf_document_pipeline(
                             document[page_number - 1],
                             desired_width=4800,
                             native_units=native_units,
-                            existing_bboxes=existing_bboxes,
+                            existing_bboxes=[],
                             defer_existing_filter=True,
-                            selective_recognition=True,
+                            selective_recognition=False,
                         )
                     finally:
                         document.close()
@@ -1049,6 +1126,11 @@ async def _translate_pdf_document_pipeline(
                         )
                         return candidates
 
+                paddle_supplement_started_at = monotonic()
+                paddle_supplement_task = asyncio.create_task(
+                    locate_raw_paddle_candidates_once()
+                )
+
                 def prepare_sheets():
                     document = fitz.open(stream=content, filetype="pdf")
                     try:
@@ -1065,8 +1147,15 @@ async def _translate_pdf_document_pipeline(
                         document.close()
 
                 locator_started_at = monotonic()
-                async with cad_local_ocr.exclusive():
-                    sheets = await loop.run_in_executor(None, prepare_sheets)
+                try:
+                    async with cad_local_ocr.exclusive():
+                        sheets = await loop.run_in_executor(None, prepare_sheets)
+                except BaseException:
+                    paddle_supplement_task.cancel()
+                    await asyncio.gather(
+                        paddle_supplement_task, return_exceptions=True
+                    )
+                    raise
                 indexed_entries = [
                     entry
                     for sheet in sheets
@@ -1107,6 +1196,26 @@ async def _translate_pdf_document_pipeline(
                     for sheet in sheets
                     for unit in (sheet.get("supplemental_units") or [])
                 ]
+                (
+                    vision_indexed_sheets,
+                    indexed_cached_rows,
+                    indexed_duplicate_rows,
+                    indexed_cache_stats,
+                ) = _compact_cad_sheets_with_source_cache(
+                    indexed_sheets,
+                    cad_confirmed_source_cache,
+                )
+                if (
+                    indexed_cache_stats["cache_hit_count"]
+                    or indexed_cache_stats["duplicate_count"]
+                ):
+                    _log_document_event(
+                        "cad_visual_source_cache_reused",
+                        filename=filename,
+                        page_number=page_number,
+                        stage="CAD 原文识别",
+                        **indexed_cache_stats,
+                    )
 
                 async def request_indexed_with_hedge(
                     request_factory,
@@ -1114,14 +1223,15 @@ async def _translate_pdf_document_pipeline(
                     group_number,
                     image_count,
                 ):
-                    """Run one indexed read and hedge only after normal waiters."""
+                    """Run one indexed read with one bounded tail-latency hedge."""
 
                     async def request_once(
                         started_event=None,
                         *,
                         owns_provider_slot=False,
+                        bypass_cad_slot=False,
                     ):
-                        if not owns_provider_slot:
+                        if not owns_provider_slot and not bypass_cad_slot:
                             await cad_vision_semaphore.acquire()
                         try:
                             if started_event is not None:
@@ -1131,7 +1241,8 @@ async def _translate_pdf_document_pipeline(
                                 timeout=CAD_INDEXED_MODEL_TIMEOUT_SECONDS,
                             )
                         finally:
-                            cad_vision_semaphore.release()
+                            if not bypass_cad_slot:
+                                cad_vision_semaphore.release()
 
                     primary_started = asyncio.Event()
                     primary = asyncio.create_task(request_once(primary_started))
@@ -1148,35 +1259,64 @@ async def _translate_pdf_document_pipeline(
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
                             if not done:
-                                # FIFO semaphore ordering leaves every normal
-                                # request already waiting ahead of this hedge.
-                                # Unlike a one-time unlocked() check, this still
-                                # uses a slot released just after the threshold.
-                                hedge_slot = asyncio.create_task(
-                                    cad_vision_semaphore.acquire()
-                                )
-                                slot_done, _slot_pending = await asyncio.wait(
-                                    {primary, hedge_slot},
-                                    return_when=asyncio.FIRST_COMPLETED,
-                                )
-                                if hedge_slot in slot_done:
-                                    hedge_slot.result()
+                                hedge_mode = "queued"
+                                if not cad_hedge_semaphore.locked():
+                                    await cad_hedge_semaphore.acquire()
                                     if primary.done():
-                                        cad_vision_semaphore.release()
-                                        hedge_slot = None
+                                        cad_hedge_semaphore.release()
                                     else:
+                                        async def request_reserved_hedge():
+                                            try:
+                                                return await request_once(
+                                                    bypass_cad_slot=True
+                                                )
+                                            finally:
+                                                cad_hedge_semaphore.release()
+
                                         hedge = asyncio.create_task(
-                                            request_once(owns_provider_slot=True)
+                                            request_reserved_hedge()
                                         )
                                         tasks.add(hedge)
-                                        hedge_slot = None
+                                        hedge_mode = "reserved"
                                         _log_document_event(
                                             "cad_indexed_vision_hedge_started",
                                             filename=filename,
                                             page_number=page_number,
                                             group_number=group_number,
                                             image_count=image_count,
+                                            mode=hedge_mode,
                                         )
+                                elif CAD_INDEXED_HEDGE_CONCURRENCY <= 0:
+                                    # An explicit zero keeps the previous FIFO
+                                    # hedge behavior for conservative rollout.
+                                    hedge_slot = asyncio.create_task(
+                                        cad_vision_semaphore.acquire()
+                                    )
+                                    slot_done, _slot_pending = await asyncio.wait(
+                                        {primary, hedge_slot},
+                                        return_when=asyncio.FIRST_COMPLETED,
+                                    )
+                                    if hedge_slot in slot_done:
+                                        hedge_slot.result()
+                                        if primary.done():
+                                            cad_vision_semaphore.release()
+                                            hedge_slot = None
+                                        else:
+                                            hedge = asyncio.create_task(
+                                                request_once(
+                                                    owns_provider_slot=True
+                                                )
+                                            )
+                                            tasks.add(hedge)
+                                            hedge_slot = None
+                                            _log_document_event(
+                                                "cad_indexed_vision_hedge_started",
+                                                filename=filename,
+                                                page_number=page_number,
+                                                group_number=group_number,
+                                                image_count=image_count,
+                                                mode=hedge_mode,
+                                            )
                         last_error = None
                         while tasks:
                             done, tasks = await asyncio.wait(
@@ -1328,14 +1468,9 @@ async def _translate_pdf_document_pipeline(
                     sheet["entries"][item_id]["bbox"]
                     for sheet, item_id in existing_refs
                 ]
-                # Candidate recall is the quality gate, so Paddle starts only
-                # after Tesseract has completed without CPU contention and its
-                # boxes are available for recognition pruning. It can still
-                # overlap the remote reading of these indexed sheets.
-                paddle_supplement_started_at = monotonic()
-                paddle_supplement_task = asyncio.create_task(
-                    locate_raw_paddle_candidates_once()
-                )
+                # Paddle was started before Tesseract sheet preparation. Its
+                # raw result is still filtered against every indexed box here,
+                # preserving the same candidate recall and merge rules.
 
                 async def read_indexed_sheet_group(
                     group_number,
@@ -1507,7 +1642,9 @@ async def _translate_pdf_document_pipeline(
                         )
                         return fallback_output
 
-                numbered_sheets = list(enumerate(indexed_sheets, start=1))
+                numbered_sheets = list(
+                    enumerate(vision_indexed_sheets, start=1)
+                )
                 grouped_sheets = [
                     numbered_sheets[index : index + CAD_INDEXED_IMAGES_PER_REQUEST]
                     for index in range(
@@ -1553,6 +1690,24 @@ async def _translate_pdf_document_pipeline(
                             continue
                         candidate["origin_item_id"] = item_id
                         unresolved_for_review.append(candidate)
+
+                # A duplicate is reused only after its representative produced
+                # confirmed Thai source text. If that representative needs a
+                # high-resolution retry, send the duplicate through the same
+                # conservative review path instead of silently dropping it.
+                recognized_rows = _commit_and_expand_cad_source_cache(
+                    recognized_rows,
+                    [],
+                    [],
+                    cad_confirmed_source_cache,
+                )
+                resolved_indexed_duplicates = []
+                for candidate, cache_key in indexed_duplicate_rows:
+                    if cad_confirmed_source_cache.get(cache_key):
+                        resolved_indexed_duplicates.append((candidate, cache_key))
+                    else:
+                        unresolved_for_review.append(dict(candidate))
+                indexed_duplicate_rows = resolved_indexed_duplicates
 
                 if unresolved_for_review:
                     review_page_png = await get_review_page_png()
@@ -1616,6 +1771,13 @@ async def _translate_pdf_document_pipeline(
                                 (sheet["entries"][item["id"]], item)
                             )
 
+                recognized_rows = _commit_and_expand_cad_source_cache(
+                    recognized_rows,
+                    indexed_cached_rows,
+                    indexed_duplicate_rows,
+                    cad_confirmed_source_cache,
+                )
+
                 if progress_callback:
                     progress_callback(
                         0,
@@ -1670,10 +1832,30 @@ async def _translate_pdf_document_pipeline(
                     paddle_sheets = await loop.run_in_executor(
                         None, prepare_paddle_review_sheets
                     )
+                    (
+                        vision_paddle_sheets,
+                        paddle_cached_rows,
+                        paddle_duplicate_rows,
+                        paddle_cache_stats,
+                    ) = _compact_cad_sheets_with_source_cache(
+                        [sheet for sheet in paddle_sheets if sheet.get("entries")],
+                        cad_confirmed_source_cache,
+                    )
+                    if (
+                        paddle_cache_stats["cache_hit_count"]
+                        or paddle_cache_stats["duplicate_count"]
+                    ):
+                        _log_document_event(
+                            "cad_visual_source_cache_reused",
+                            filename=filename,
+                            page_number=page_number,
+                            stage="CAD Paddle 补漏",
+                            **paddle_cache_stats,
+                        )
                     numbered_paddle_sheets = [
                         (sheet_number, sheet)
                         for sheet_number, sheet in enumerate(
-                            paddle_sheets, start=1
+                            vision_paddle_sheets, start=1
                         )
                         if sheet.get("entries")
                     ]
@@ -1704,13 +1886,22 @@ async def _translate_pdf_document_pipeline(
                         for group_results in paddle_group_results
                         for result in group_results
                     ]
+                    paddle_recognized_rows = []
                     for sheet, items, route in paddle_results:
                         if route:
                             reader_providers.append(route)
                         for item in items:
-                            recognized_rows.append(
+                            paddle_recognized_rows.append(
                                 (sheet["entries"][item["id"]], item)
                             )
+                    recognized_rows.extend(
+                        _commit_and_expand_cad_source_cache(
+                            paddle_recognized_rows,
+                            paddle_cached_rows,
+                            paddle_duplicate_rows,
+                            cad_confirmed_source_cache,
+                        )
+                    )
 
                 unique_segments = []
                 translation_segment_by_source = {}
@@ -1753,17 +1944,63 @@ async def _translate_pdf_document_pipeline(
                         0,
                         f"正在流水线翻译并回写 CAD 文字（第 {page_number} 页）",
                     )
-                text_translations, text_providers, text_warnings = (
-                    # Adaptive CAD batches all receive the complete page source
-                    # context, so moderate pages can translate in parallel
-                    # without dropping terminology context.
-                    await _translate_document_segments(
-                        translation_segments,
-                        "th",
-                        target_language,
-                        context,
+                (
+                    pending_translation_segments,
+                    translation_cache_keys,
+                    cached_text_translations,
+                    waiting_text_translations,
+                ) = await cad_text_translation_cache.claim(translation_segments)
+                if pending_translation_segments:
+                    try:
+                        text_translations, text_providers, text_warnings = (
+                            # Adaptive CAD batches all receive the complete page
+                            # source context. Concurrent identical source strings
+                            # are coalesced into the first owning page request.
+                            await _translate_document_segments(
+                                pending_translation_segments,
+                                "th",
+                                target_language,
+                                context,
+                            )
+                        )
+                        await cad_text_translation_cache.resolve(
+                            translation_cache_keys,
+                            text_translations,
+                        )
+                    except BaseException as exc:
+                        await cad_text_translation_cache.fail(
+                            translation_cache_keys,
+                            exc,
+                        )
+                        raise
+                else:
+                    text_translations, text_providers, text_warnings = (
+                        {},
+                        [],
+                        [],
                     )
+                if waiting_text_translations:
+                    waited_values = await asyncio.gather(
+                        *waiting_text_translations.values()
+                    )
+                    text_translations.update(
+                        dict(zip(waiting_text_translations, waited_values))
+                    )
+                text_translations.update(cached_text_translations)
+                reused_translation_count = (
+                    len(cached_text_translations)
+                    + len(waiting_text_translations)
                 )
+                if reused_translation_count:
+                    text_providers = [*text_providers, "document-cache"]
+                    _log_document_event(
+                        "cad_text_translation_cache_reused",
+                        filename=filename,
+                        page_number=page_number,
+                        cached_count=len(cached_text_translations),
+                        coalesced_count=len(waiting_text_translations),
+                        requested_count=len(pending_translation_segments),
+                    )
                 page_layout = []
                 for candidate, item in recognized_rows:
                     source_value = str(item.get("source_text") or "").strip()
@@ -3532,6 +3769,103 @@ def _cad_source_hint_is_reliable(candidate: Dict) -> bool:
         and thai_length / max(1, non_space_length) >= 0.30
         and (bool(thai_marks) or consonant_diversity >= 0.60)
     )
+
+
+def _cad_visual_source_cache_key(candidate: Dict) -> Optional[str]:
+    """Return a conservative key for reusing a confirmed CAD source row."""
+    inherited_key = str(candidate.get("source_cache_key") or "").strip()
+    if re.fullmatch(r"[0-9a-f]{64}:.*[\u0E00-\u0E7F].*", inherited_key):
+        return inherited_key
+    fingerprint = str(candidate.get("visual_fingerprint") or "").strip().lower()
+    source_hint = re.sub(
+        r"\s+", " ", str(candidate.get("source_hint") or "").strip()
+    )
+    if (
+        len(fingerprint) != 64
+        or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+        or not re.search(r"[\u0E00-\u0E7F]", source_hint)
+        or float(candidate.get("source_confidence") or 0.0) < 40.0
+    ):
+        return None
+    return f"{fingerprint}:{source_hint}"
+
+
+def _compact_cad_sheets_with_source_cache(
+    sheets: List[Dict],
+    source_cache: Dict[str, str],
+):
+    """Remove only exact confirmed or within-batch duplicate visual rows.
+
+    The glyph fingerprint is paired with the local Thai OCR hint. Rows without
+    both signals remain untouched and always reach the vision provider.
+    """
+    seen_keys = set()
+    reduced_sheets = []
+    cached_rows = []
+    duplicate_rows = []
+    original_count = 0
+    sent_count = 0
+    for sheet in sheets:
+        entries = sheet.get("entries") or {}
+        original_count += len(entries)
+        selected_ids = []
+        for item_id, candidate in entries.items():
+            cache_key = _cad_visual_source_cache_key(candidate)
+            if cache_key:
+                candidate["source_cache_key"] = cache_key
+            cached_source = source_cache.get(cache_key) if cache_key else None
+            if cached_source:
+                cached_rows.append((candidate, cached_source))
+                continue
+            if cache_key and cache_key in seen_keys:
+                duplicate_rows.append((candidate, cache_key))
+                continue
+            if cache_key:
+                seen_keys.add(cache_key)
+            selected_ids.append(item_id)
+        if not selected_ids:
+            continue
+        sent_count += len(selected_ids)
+        reduced_sheets.append(
+            sheet
+            if len(selected_ids) == len(entries)
+            else subset_indexed_translation_sheet(sheet, selected_ids)
+        )
+    return (
+        reduced_sheets,
+        cached_rows,
+        duplicate_rows,
+        {
+            "original_count": original_count,
+            "sent_count": sent_count,
+            "cache_hit_count": len(cached_rows),
+            "duplicate_count": len(duplicate_rows),
+        },
+    )
+
+
+def _commit_and_expand_cad_source_cache(
+    recognized_rows,
+    cached_rows,
+    duplicate_rows,
+    source_cache: Dict[str, str],
+):
+    """Commit vision-confirmed Thai text, then restore reused layout rows."""
+    output = list(recognized_rows)
+    for candidate, item in recognized_rows:
+        source_text = str(item.get("source_text") or "").strip()
+        cache_key = _cad_visual_source_cache_key(candidate)
+        if cache_key and re.search(r"[\u0E00-\u0E7F]", source_text):
+            source_cache[cache_key] = source_text
+    for candidate, source_text in cached_rows:
+        output.append((candidate, {"id": "CACHE", "source_text": source_text}))
+    for candidate, cache_key in duplicate_rows:
+        source_text = source_cache.get(cache_key)
+        if source_text:
+            output.append(
+                (candidate, {"id": "DUPLICATE", "source_text": source_text})
+            )
+    return output
 
 
 def _cad_indexed_read_needs_review(candidate: Dict, item: Dict) -> bool:

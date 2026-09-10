@@ -1,3 +1,4 @@
+import hashlib
 import math
 import os
 import re
@@ -140,6 +141,66 @@ def _encode_cad_png(image):
         image,
         [cv2.IMWRITE_PNG_COMPRESSION, _CAD_PNG_COMPRESSION_LEVEL],
     )
+
+
+def _cad_target_visual_fingerprint(image, rect, *, vertical: bool = False) -> str:
+    """Hash only the target glyph pixels for safe reuse across CAD pages.
+
+    Review sheets include a wide and page-specific context crop. Hashing that
+    canvas prevents repeated title-block labels from matching. This helper
+    instead normalizes the tight OCR target to a binary 64px-high bitmap. A
+    caller still combines the digest with the local OCR hint, so reuse needs
+    both matching glyph pixels and matching Thai text evidence.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("CAD 字形指纹运行环境不完整") from exc
+
+    height, width = image.shape[:2]
+    x0 = max(0, int(math.floor(rect.x0)) - 2)
+    y0 = max(0, int(math.floor(rect.y0)) - 2)
+    x1 = min(width, int(math.ceil(rect.x1)) + 2)
+    y1 = min(height, int(math.ceil(rect.y1)) + 2)
+    target = image[y0:y1, x0:x1]
+    if target.size == 0:
+        return ""
+    if vertical:
+        target = cv2.rotate(target, cv2.ROTATE_90_CLOCKWISE)
+    gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+    _threshold, binary = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    # Remove blank margins introduced by slightly different detector boxes.
+    ink = np.where(binary < 128)
+    if not ink[0].size:
+        return ""
+    binary = binary[
+        max(0, int(ink[0].min()) - 1) : min(binary.shape[0], int(ink[0].max()) + 2),
+        max(0, int(ink[1].min()) - 1) : min(binary.shape[1], int(ink[1].max()) + 2),
+    ]
+    if binary.size == 0:
+        return ""
+    normalized_height = 64
+    normalized_width = max(
+        1,
+        min(
+            2048,
+            round(binary.shape[1] * normalized_height / max(1, binary.shape[0])),
+        ),
+    )
+    normalized = cv2.resize(
+        binary,
+        (normalized_width, normalized_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    payload = (
+        normalized_height.to_bytes(2, "big")
+        + normalized_width.to_bytes(2, "big")
+        + normalized.tobytes()
+    )
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _paddle_runtime_kwargs() -> Dict[str, Any]:
@@ -1307,6 +1368,11 @@ def prepare_dense_cad_translation_sheets(
             crop = image[y0:y1, x0:x1]
             if crop.size == 0:
                 continue
+            candidate["visual_fingerprint"] = _cad_target_visual_fingerprint(
+                image,
+                rect,
+                vertical=candidate["vertical"],
+            )
             if candidate["vertical"]:
                 crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
             crop_scale = min(
@@ -1800,6 +1866,12 @@ def prepare_dense_cad_review_sheets(
         crop = image[y0:y1, x0:x1].copy()
         if crop.size == 0:
             continue
+        source = dict(source)
+        source["visual_fingerprint"] = _cad_target_visual_fingerprint(
+            image,
+            target,
+            vertical=vertical,
+        )
         local_target = fitz.Rect(
             target.x0 - x0,
             target.y0 - y0,
@@ -1897,7 +1969,7 @@ def prepare_dense_cad_review_sheets(
                 "review_id": f"RID{candidate_index:04d}",
                 "crop": crop,
                 "context_crop": context_crop,
-                "candidate": dict(source),
+                "candidate": source,
             }
         )
 

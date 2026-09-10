@@ -127,6 +127,69 @@ def test_cad_local_ocr_coordinator_overlaps_locator_with_bounded_paddle():
     asyncio.run(scenario())
 
 
+def test_cad_text_translation_cache_coalesces_inflight_and_resolved_values():
+    async def scenario():
+        cache = main_module._CadTextTranslationCache()
+        first = DocumentSegment(
+            segment_id="page-1",
+            page_number=1,
+            text="  ระบบ   ควบคุม  ",
+            source_kind="outline-text",
+        )
+        repeated = replace(first, segment_id="page-2", page_number=2)
+
+        owners, owner_keys, cached, waiters = await cache.claim([first])
+        assert owners == [first]
+        assert owner_keys == {"page-1": "ระบบ ควบคุม"}
+        assert cached == {}
+        assert waiters == {}
+
+        owners, _, cached, waiters = await cache.claim([repeated])
+        assert owners == []
+        assert cached == {}
+        assert list(waiters) == ["page-2"]
+
+        await cache.resolve(owner_keys, {"page-1": "控制系统"})
+        assert await waiters["page-2"] == "控制系统"
+
+        owners, _, cached, waiters = await cache.claim([repeated])
+        assert owners == []
+        assert cached == {"page-2": "控制系统"}
+        assert waiters == {}
+
+    asyncio.run(scenario())
+
+
+def test_cad_text_translation_cache_releases_waiters_on_incomplete_result():
+    async def scenario():
+        cache = main_module._CadTextTranslationCache()
+        segment = DocumentSegment(
+            segment_id="owner",
+            page_number=1,
+            text="ทดสอบ",
+            source_kind="outline-text",
+        )
+        owners, owner_keys, _, _ = await cache.claim([segment])
+        assert owners == [segment]
+        _, _, _, waiters = await cache.claim(
+            [replace(segment, segment_id="waiter", page_number=2)]
+        )
+
+        with pytest.raises(RuntimeError, match="ID_MISMATCH") as error:
+            await cache.resolve(owner_keys, {})
+        await cache.fail(owner_keys, error.value)
+        with pytest.raises(RuntimeError, match="ID_MISMATCH"):
+            await waiters["waiter"]
+
+        owners, _, cached, waiters = await cache.claim([segment])
+        assert owners == [segment]
+        assert cached == {}
+        assert waiters == {}
+        await cache.fail({"owner": cache.key(segment.text)}, RuntimeError("done"))
+
+    asyncio.run(scenario())
+
+
 def test_cad_indexed_no_text_retry_keeps_short_confident_thai_label():
     candidate = {
         "source_hint": "จุ",
@@ -725,6 +788,104 @@ def test_layout_result_reuses_translation_for_identical_ocr_source():
     assert [
         item["translated_text"] for item in result.layout_segments
     ] == ["基准价制定委员会委员", "基准价制定委员会委员"]
+
+
+def test_cad_visual_source_cache_compacts_exact_glyph_and_hint_matches(
+    monkeypatch,
+):
+    fingerprint_a = "a" * 64
+    fingerprint_b = "b" * 64
+    first = {
+        "visual_fingerprint": fingerprint_a,
+        "source_hint": "ข้อความ",
+        "source_confidence": 92.0,
+        "sheet_row": 0,
+    }
+    duplicate = dict(first, sheet_row=1)
+    cached = {
+        "visual_fingerprint": fingerprint_b,
+        "source_hint": "อาคาร",
+        "source_confidence": 88.0,
+        "sheet_row": 2,
+    }
+    sheet = {
+        "content": b"sheet",
+        "entries": {"ID001": first, "ID002": duplicate, "ID003": cached},
+    }
+
+    def fake_subset(source_sheet, item_ids):
+        return {
+            "content": b"subset",
+            "entries": {
+                item_id: source_sheet["entries"][item_id]
+                for item_id in item_ids
+            },
+        }
+
+    monkeypatch.setattr(
+        main_module, "subset_indexed_translation_sheet", fake_subset
+    )
+    cache = {f"{fingerprint_b}:อาคาร": "อาคาร"}
+
+    reduced, cached_rows, duplicates, details = (
+        main_module._compact_cad_sheets_with_source_cache([sheet], cache)
+    )
+
+    assert list(reduced[0]["entries"]) == ["ID001"]
+    assert details == {
+        "original_count": 3,
+        "sent_count": 1,
+        "cache_hit_count": 1,
+        "duplicate_count": 1,
+    }
+    expanded = main_module._commit_and_expand_cad_source_cache(
+        [(first, {"id": "ID001", "source_text": "ข้อความ"})],
+        cached_rows,
+        duplicates,
+        cache,
+    )
+    assert [item["source_text"] for _candidate, item in expanded] == [
+        "ข้อความ",
+        "อาคาร",
+        "ข้อความ",
+    ]
+
+
+def test_cad_visual_source_cache_never_reuses_without_both_signals(monkeypatch):
+    candidates = {
+        "NO_HASH": {
+            "source_hint": "ข้อความ",
+            "source_confidence": 99.0,
+            "sheet_row": 0,
+        },
+        "NO_HINT": {
+            "visual_fingerprint": "c" * 64,
+            "source_hint": "",
+            "source_confidence": 99.0,
+            "sheet_row": 1,
+        },
+        "LOW_CONFIDENCE": {
+            "visual_fingerprint": "d" * 64,
+            "source_hint": "ข้อความ",
+            "source_confidence": 39.9,
+            "sheet_row": 2,
+        },
+    }
+    sheet = {"content": b"sheet", "entries": candidates}
+    monkeypatch.setattr(
+        main_module,
+        "subset_indexed_translation_sheet",
+        lambda source_sheet, _item_ids: source_sheet,
+    )
+
+    reduced, cached_rows, duplicates, details = (
+        main_module._compact_cad_sheets_with_source_cache([sheet], {})
+    )
+
+    assert reduced == [sheet]
+    assert cached_rows == []
+    assert duplicates == []
+    assert details["sent_count"] == 3
 
 
 def test_layout_pdf_export_matches_rotated_source_page_orientation():
@@ -3313,7 +3474,9 @@ def test_dense_cad_group_hedges_when_slot_frees_after_delay(monkeypatch):
     ] == [1]
 
 
-def test_dense_cad_group_does_not_hedge_while_primary_waits_for_slot(monkeypatch):
+def test_dense_cad_reserved_hedge_targets_running_primary_not_queued_page(
+    monkeypatch,
+):
     content = make_pdf(["CAD 1", "CAD 2"])
     pages = [
         ParsedPdfPage(
@@ -3410,10 +3573,15 @@ def test_dense_cad_group_does_not_hedge_while_primary_waits_for_slot(monkeypatch
         for event, details in events
         if event == "cad_indexed_vision_hedge_started"
     ]
-    assert hedge_pages == []
+    assert hedge_pages == [1]
+    assert [
+        details["mode"]
+        for event, details in events
+        if event == "cad_indexed_vision_hedge_started"
+    ] == ["reserved"]
 
 
-def test_dense_cad_finishes_tesseract_sheet_build_before_paddle_detection(
+def test_dense_cad_overlaps_tesseract_sheet_build_with_paddle_detection(
     monkeypatch,
 ):
     content = make_pdf(["CAD"])
@@ -3425,6 +3593,7 @@ def test_dense_cad_finishes_tesseract_sheet_build_before_paddle_detection(
         profile={"drawing_count": 50_000, "visual_required": True},
     )
     tesseract_finished = threading.Event()
+    paddle_started = threading.Event()
     page_stream_finished = threading.Event()
 
     def fake_iter_pages(*_args):
@@ -3437,14 +3606,16 @@ def test_dense_cad_finishes_tesseract_sheet_build_before_paddle_detection(
 
     def fake_detect(*_args, **kwargs):
         assert kwargs["defer_existing_filter"] is True
-        assert kwargs["selective_recognition"] is True
+        assert kwargs["selective_recognition"] is False
         assert kwargs["existing_bboxes"] == []
-        assert tesseract_finished.is_set()
+        paddle_started.set()
+        assert tesseract_finished.wait(1.0)
         return []
 
     def fake_prepare(*_args, **_kwargs):
         assert page_stream_finished.is_set()
         assert not tesseract_finished.is_set()
+        assert paddle_started.wait(1.0)
         tesseract_finished.set()
         return []
 
@@ -3474,6 +3645,7 @@ def test_dense_cad_finishes_tesseract_sheet_build_before_paddle_detection(
         )
     )
     assert tesseract_finished.is_set()
+    assert paddle_started.is_set()
 
 
 def test_dense_cad_reuses_one_paddle_worker_across_pages(monkeypatch):
@@ -3518,8 +3690,8 @@ def test_dense_cad_reuses_one_paddle_worker_across_pages(monkeypatch):
             )
 
     assert len(worker_threads) == 4
-    assert len(set(worker_threads)) == 1
-    assert worker_threads[0] != threading.get_ident()
+    assert 1 <= len(set(worker_threads)) <= main_module.CAD_PADDLE_WORKERS
+    assert all(worker != threading.get_ident() for worker in worker_threads)
 
 
 def test_dense_cad_serializes_tesseract_sheet_builds_across_pages(monkeypatch):

@@ -129,6 +129,29 @@ def test_pixmap_direct_conversion_matches_lossless_png_decode():
     assert np.array_equal(actual, expected)
 
 
+def test_cad_target_visual_fingerprint_is_stable_and_content_sensitive():
+    image = np.full((90, 260, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (20, 24), (180, 58), (0, 0, 0), 2)
+    cv2.line(image, (35, 41), (160, 41), (0, 0, 0), 3)
+    rect = fitz.Rect(16, 20, 184, 62)
+
+    first = visual_pdf._cad_target_visual_fingerprint(image, rect)
+    second = visual_pdf._cad_target_visual_fingerprint(image.copy(), rect)
+    changed = image.copy()
+    cv2.circle(changed, (110, 41), 8, (255, 255, 255), -1)
+
+    assert len(first) == 64
+    assert second == first
+    assert visual_pdf._cad_target_visual_fingerprint(changed, rect) != first
+    assert (
+        visual_pdf._cad_target_visual_fingerprint(
+            np.full((20, 20, 3), 255, dtype=np.uint8),
+            fitz.Rect(0, 0, 20, 20),
+        )
+        == ""
+    )
+
+
 def test_paddle_runtime_kwargs_are_optional_and_bounded(monkeypatch):
     monkeypatch.setattr(visual_pdf, "_PADDLE_ENABLE_MKLDNN", True)
     monkeypatch.setenv("APP_PADDLE_DEVICE", "gpu:0")
