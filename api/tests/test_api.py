@@ -3614,6 +3614,7 @@ def test_dense_cad_group_hedges_when_slot_frees_after_delay(monkeypatch):
     monkeypatch.setattr(main_module, "CAD_INDEXED_IMAGES_PER_REQUEST", 2)
     monkeypatch.setattr(main_module, "CAD_INDEXED_MODEL_CONCURRENCY", 2)
     monkeypatch.setattr(main_module, "CAD_INDEXED_HEDGE_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(main_module, "CAD_INDEXED_HEDGE_CONCURRENCY", 1)
     monkeypatch.setattr(
         main_module,
         "_log_document_event",
