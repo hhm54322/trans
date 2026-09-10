@@ -38,12 +38,87 @@ _CAD_TEXT_DETECTOR = None
 _TEXT_RECOGNIZER_LOCK = threading.Lock()
 _TEXT_RECOGNIZER = None
 _OCR_WORKER_PDF_CONTENT = None
-# Each dense CAD page starts four Tesseract orientation/scale passes. Page
-# concurrency can otherwise multiply this into 16 CPU-bound subprocesses;
-# once they cross documents.ocr_image_text_blocks' timeout, the page silently
-# loses every candidate from that pass. Keep enough parallelism to saturate a
-# normal workstation without turning CPU contention into missing text.
-_CAD_TESSERACT_SEMAPHORE = threading.BoundedSemaphore(4)
+
+
+def _runtime_cpu_count() -> int:
+    """Return the CPU budget visible to this process, including cgroups."""
+
+    counts = [max(1, os.cpu_count() or 1)]
+    try:
+        counts.append(max(1, len(os.sched_getaffinity(0))))
+    except (AttributeError, OSError):
+        pass
+    quota_paths = (
+        (Path("/sys/fs/cgroup/cpu.max"), None),
+        (
+            Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"),
+            Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
+        ),
+    )
+    for quota_path, period_path in quota_paths:
+        try:
+            if period_path is None:
+                quota_value, period_value = quota_path.read_text().split()[:2]
+                if quota_value == "max":
+                    continue
+                quota, period = int(quota_value), int(period_value)
+            else:
+                quota = int(quota_path.read_text().strip())
+                period = int(period_path.read_text().strip())
+            if quota > 0 and period > 0:
+                counts.append(max(1, quota // period))
+        except (OSError, ValueError):
+            continue
+    return min(counts)
+
+
+def _runtime_memory_limit_bytes() -> int:
+    """Return the smallest usable host/cgroup memory limit, or zero."""
+
+    limits = []
+    for path in (
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            value = path.read_text().strip()
+            if value != "max":
+                parsed = int(value)
+                if 0 < parsed < 1 << 60:
+                    limits.append(parsed)
+        except (OSError, ValueError):
+            continue
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        page_count = int(os.sysconf("SC_PHYS_PAGES"))
+        if page_size > 0 and page_count > 0:
+            limits.append(page_size * page_count)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return min(limits) if limits else 0
+
+
+def _recommended_cad_paddle_workers(cpu_count: int, memory_bytes: int) -> int:
+    """Use two predictors only when the deployment has a safe headroom."""
+
+    return 2 if cpu_count >= 8 and memory_bytes >= 12 * 1024**3 else 1
+
+
+def cad_paddle_worker_count() -> int:
+    configured = os.getenv("APP_CAD_PADDLE_WORKERS", "auto").strip().lower()
+    if not configured or configured == "auto":
+        return _recommended_cad_paddle_workers(_CPU_COUNT, _MEMORY_LIMIT_BYTES)
+    return max(1, min(4, int(configured)))
+
+
+# Reserve roughly half of the detected CPU capacity for Paddle while it runs
+# beside Tesseract. This is based on the container's runtime resources rather
+# than a developer workstation and keeps low-core hosts from oversubscribing.
+_CPU_COUNT = _runtime_cpu_count()
+_MEMORY_LIMIT_BYTES = _runtime_memory_limit_bytes()
+_CAD_TESSERACT_WORKERS = max(1, min(4, _CPU_COUNT // 2))
+_CAD_PADDLE_WORKERS = cad_paddle_worker_count()
+_CAD_TESSERACT_SEMAPHORE = threading.BoundedSemaphore(_CAD_TESSERACT_WORKERS)
 # Dense architectural sheets are frequently A1 or larger. Passing their
 # complete 4k render through a 1600px detection model loses the smallest
 # outlined labels before the vision model ever has a chance to read them.
@@ -73,8 +148,17 @@ def _paddle_runtime_kwargs() -> Dict[str, Any]:
     device = os.getenv("APP_PADDLE_DEVICE", "").strip()
     if device:
         kwargs["device"] = device
-    cpu_threads = os.getenv("APP_PADDLE_CPU_THREADS", "").strip()
-    if cpu_threads:
+    cpu_threads = os.getenv("APP_PADDLE_CPU_THREADS", "auto").strip().lower()
+    if not cpu_threads or cpu_threads == "auto":
+        # One Paddle predictor is the safe default. Giving it the other half
+        # of the machine permits one Tesseract page to progress concurrently
+        # without changing either OCR engine's detection thresholds.
+        paddle_cpu_budget = max(1, _CPU_COUNT - _CAD_TESSERACT_WORKERS)
+        kwargs["cpu_threads"] = max(
+            1,
+            min(8, paddle_cpu_budget // _CAD_PADDLE_WORKERS),
+        )
+    else:
         kwargs["cpu_threads"] = max(1, min(64, int(cpu_threads)))
     return kwargs
 

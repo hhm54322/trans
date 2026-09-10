@@ -2,6 +2,7 @@ import csv
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -19,6 +20,8 @@ from .pdf_routing import freeze_pdf_page_route
 WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 DRAWING_NAMESPACE = "http://schemas.openxmlformats.org/drawingml/2006/main"
 SLIDE_PART_PATTERN = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
+_TESSERACT_LANGUAGES_LOCK = threading.Lock()
+_TESSERACT_LANGUAGES_BY_EXECUTABLE: Dict[str, set] = {}
 
 
 @dataclass
@@ -534,15 +537,7 @@ def ocr_image_text_blocks(
     if not executable or not content:
         return []
     try:
-        languages = subprocess.run(
-            [executable, "--list-langs"],
-            input=b"",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=5,
-        ).stdout.decode("utf-8", errors="ignore")
-        available = set(languages.split())
+        available = _available_tesseract_languages(executable)
         selected_language = language
         if "tha" not in available and "eng" in available:
             selected_language = "eng"
@@ -652,6 +647,29 @@ def ocr_image_text_blocks(
             }
         )
     return blocks
+
+
+def _available_tesseract_languages(executable: str) -> set:
+    """Read the installed language list once for all OCR passes and pages."""
+
+    cached = _TESSERACT_LANGUAGES_BY_EXECUTABLE.get(executable)
+    if cached is not None:
+        return cached
+    with _TESSERACT_LANGUAGES_LOCK:
+        cached = _TESSERACT_LANGUAGES_BY_EXECUTABLE.get(executable)
+        if cached is not None:
+            return cached
+        languages = subprocess.run(
+            [executable, "--list-langs"],
+            input=b"",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        ).stdout.decode("utf-8", errors="ignore")
+        available = set(languages.split())
+        _TESSERACT_LANGUAGES_BY_EXECUTABLE[executable] = available
+        return available
 
 
 def decode_text(content: bytes) -> str:

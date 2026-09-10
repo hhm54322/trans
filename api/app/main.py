@@ -60,6 +60,7 @@ from .services.visual_pdf import (
     # Retained as an explicit diagnostic hook and for backwards-compatible
     # test instrumentation. Auto CAD routing no longer invokes it.
     detect_dense_cad_paddle_candidates,
+    cad_paddle_worker_count,
     extract_visual_page_units,
     extract_visual_page_units_in_worker,
     filter_dense_cad_paddle_candidates,
@@ -108,7 +109,7 @@ CAD_GAP_ROWS_PER_SHEET = 6
 # faster than a large, serial image while keeping each line legible.
 CAD_PADDLE_DETECTOR_ROWS_PER_SHEET = 12
 CAD_INDEXED_IMAGES_PER_REQUEST = max(
-    1, min(4, int(os.getenv("APP_CAD_INDEXED_IMAGES_PER_REQUEST", "2")))
+    1, min(4, int(os.getenv("APP_CAD_INDEXED_IMAGES_PER_REQUEST", "3")))
 )
 # Focused review sheets contain only three enlarged rows. Four separate images
 # therefore expose no more targets than one 12-row primary sheet while turning
@@ -134,21 +135,7 @@ CAD_VISUAL_PAGE_CONCURRENCY = max(
         int(os.getenv("APP_CAD_VISUAL_PAGE_CONCURRENCY", "4")),
     ),
 )
-CAD_LOCAL_OCR_CONCURRENCY = max(
-    1, min(4, int(os.getenv("APP_CAD_LOCAL_OCR_CONCURRENCY", "1")))
-)
-CAD_PADDLE_WORKERS = max(
-    1,
-    min(
-        4,
-        int(
-            os.getenv(
-                "APP_CAD_PADDLE_WORKERS",
-                str(CAD_LOCAL_OCR_CONCURRENCY),
-            )
-        ),
-    ),
-)
+CAD_PADDLE_WORKERS = cad_paddle_worker_count()
 # This is a per-request guard, not a page-level service target. Gateway queue
 # time can exceed 30 seconds for a healthy high-detail image request, so allow
 # it to drain before invoking the bounded retry/review path. The provider's
@@ -240,29 +227,18 @@ document_job_tasks: Dict[str, asyncio.Task] = {}
 
 
 class _CadLocalOcrCoordinator:
-    """Prioritize exact candidate location, then share spare Paddle capacity."""
+    """Serialize Tesseract page builds while allowing bounded Paddle overlap."""
 
     def __init__(self, paddle_limit: int):
         self._condition = asyncio.Condition()
         self._paddle_limit = max(1, int(paddle_limit))
         self._exclusive_active = False
         self._active_paddles = 0
-        self._waiting_exclusive = 0
 
     @asynccontextmanager
     async def exclusive(self):
         async with self._condition:
-            self._waiting_exclusive += 1
-            try:
-                await self._condition.wait_for(
-                    lambda: not self._exclusive_active
-                    and self._active_paddles == 0
-                )
-            except BaseException:
-                self._waiting_exclusive -= 1
-                self._condition.notify_all()
-                raise
-            self._waiting_exclusive -= 1
+            await self._condition.wait_for(lambda: not self._exclusive_active)
             self._exclusive_active = True
         try:
             yield
@@ -275,9 +251,7 @@ class _CadLocalOcrCoordinator:
     async def paddle(self):
         async with self._condition:
             await self._condition.wait_for(
-                lambda: not self._exclusive_active
-                and self._waiting_exclusive == 0
-                and self._active_paddles < self._paddle_limit
+                lambda: self._active_paddles < self._paddle_limit
             )
             self._active_paddles += 1
         try:
@@ -1048,11 +1022,32 @@ async def _translate_pdf_document_pipeline(
                         document.close()
 
                 async def locate_raw_paddle_candidates_once():
+                    queue_started_at = monotonic()
                     async with cad_local_ocr.paddle():
-                        return await loop.run_in_executor(
+                        worker_started_at = monotonic()
+                        _log_document_event(
+                            "cad_paddle_worker_started",
+                            filename=filename,
+                            page_number=page_number,
+                            queue_ms=round(
+                                (worker_started_at - queue_started_at) * 1000
+                            ),
+                            worker_limit=CAD_PADDLE_WORKERS,
+                        )
+                        candidates = await loop.run_in_executor(
                             _cad_paddle_executor,
                             locate_raw_paddle_candidates,
                         )
+                        _log_document_event(
+                            "cad_paddle_worker_completed",
+                            filename=filename,
+                            page_number=page_number,
+                            candidate_count=len(candidates),
+                            inference_ms=round(
+                                (monotonic() - worker_started_at) * 1000
+                            ),
+                        )
+                        return candidates
 
                 def prepare_sheets():
                     document = fitz.open(stream=content, filetype="pdf")
@@ -1544,7 +1539,13 @@ async def _translate_pdf_document_pipeline(
                     if route:
                         reader_providers.append(route)
                     for item in items:
-                        recognized_rows.append((sheet["entries"][item["id"]], item))
+                        candidate = sheet["entries"][item["id"]]
+                        if _cad_indexed_read_needs_review(candidate, item):
+                            candidate = dict(candidate)
+                            candidate["origin_item_id"] = item["id"]
+                            unresolved_for_review.append(candidate)
+                            continue
+                        recognized_rows.append((candidate, item))
                     for item_id in sheet.get("unresolved_ids") or []:
                         candidate = dict(sheet["entries"][item_id])
                         if _cad_candidate_is_tiny_unreadable_label(candidate):
@@ -3530,6 +3531,32 @@ def _cad_source_hint_is_reliable(candidate: Dict) -> bool:
         and len(set(consonants)) >= 2
         and thai_length / max(1, non_space_length) >= 0.30
         and (bool(thai_marks) or consonant_diversity >= 0.60)
+    )
+
+
+def _cad_indexed_read_needs_review(candidate: Dict, item: Dict) -> bool:
+    """Reject a visual no-text result that contradicts reliable local OCR.
+
+    The indexed model may occasionally emit ``[NO_TEXT]`` or an English-only
+    reading for a legible Thai row. Treating that as a successful response
+    silently drops the candidate. A focused high-resolution retry is cheaper
+    than another full-page pass and preserves the local OCR's role as a
+    quality alarm rather than an authoritative transcription source.
+    """
+
+    source_text = str(item.get("source_text") or "").strip()
+    if re.search(r"[\u0E00-\u0E7F]", source_text):
+        return False
+    if _cad_source_hint_is_reliable(candidate):
+        return True
+    # A literal no-text answer is a stronger contradiction than an alternate
+    # English reading. Preserve short real labels such as a one-consonant Thai
+    # syllable when Tesseract saw at least two Thai code points confidently.
+    source_hint = str(candidate.get("source_hint") or "")
+    return (
+        source_text.upper() == "[NO_TEXT]"
+        and float(candidate.get("source_confidence") or 0.0) >= 80.0
+        and len(re.findall(r"[\u0E00-\u0E7F]", source_hint)) >= 2
     )
 
 

@@ -11,7 +11,10 @@ FROM python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_DATABASE_PATH=/app/data/app.db \
-    APP_CORS_ORIGINS=http://localhost:8000
+    APP_CORS_ORIGINS=http://localhost:8000 \
+    PADDLE_PDX_CACHE_HOME=/app/paddle-cache \
+    PADDLE_PDX_MODEL_SOURCE=modelscope \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 
 WORKDIR /app
 COPY api/requirements.txt ./api/requirements.txt
@@ -21,11 +24,12 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
           -e 's#deb.debian.org/debian#mirrors.aliyun.com/debian#g' \
           /etc/apt/sources.list.d/debian.sources; \
     fi \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
         fonts-dejavu-core \
         fonts-noto-cjk \
         fonts-noto-core \
+        fonts-wqy-zenhei \
         libgl1 \
         libglib2.0-0 \
         tesseract-ocr \
@@ -35,12 +39,11 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
 RUN pip install --no-cache-dir \
     --index-url https://mirrors.aliyun.com/pypi/simple \
     -r api/requirements.txt
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends fonts-wqy-zenhei \
-    && rm -rf /var/lib/apt/lists/*
+COPY api/scripts/preload_paddle_models.py ./api/scripts/preload_paddle_models.py
+RUN python api/scripts/preload_paddle_models.py
 COPY api/ ./api/
 COPY --from=web-builder /build/web/dist ./web/dist
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/paddle-cache
 
 EXPOSE 8000
 CMD ["uvicorn", "api.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

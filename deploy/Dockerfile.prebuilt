@@ -3,6 +3,11 @@ ARG RUNTIME_BASE=siamlink-siamlink:final-20260907
 FROM ${RUNTIME_BASE}
 
 WORKDIR /app
+ENV PADDLE_PDX_CACHE_HOME=/app/paddle-cache \
+    PADDLE_PDX_MODEL_SOURCE=modelscope \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+COPY api/scripts/preload_paddle_models.py ./api/scripts/preload_paddle_models.py
+RUN python api/scripts/preload_paddle_models.py
 COPY api/ ./api/
 COPY web/dist/ ./web/dist/
 

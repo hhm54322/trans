@@ -64,12 +64,13 @@ def setup_module():
         TEST_DATABASE.unlink()
 
 
-def test_cad_local_ocr_coordinator_prioritizes_locator_then_shares_paddle():
+def test_cad_local_ocr_coordinator_overlaps_locator_with_bounded_paddle():
     async def scenario():
-        coordinator = main_module._CadLocalOcrCoordinator(2)
+        coordinator = main_module._CadLocalOcrCoordinator(1)
         events = []
         first_paddle_acquired = asyncio.Event()
         release_first_paddle = asyncio.Event()
+        locator_acquired = asyncio.Event()
         release_exclusive = asyncio.Event()
         both_paddles_acquired = asyncio.Event()
 
@@ -82,6 +83,7 @@ def test_cad_local_ocr_coordinator_prioritizes_locator_then_shares_paddle():
         async def exclusive_locator():
             async with coordinator.exclusive():
                 events.append("locator")
+                locator_acquired.set()
                 await release_exclusive.wait()
 
         async def second_paddle():
@@ -91,15 +93,15 @@ def test_cad_local_ocr_coordinator_prioritizes_locator_then_shares_paddle():
         first_task = asyncio.create_task(first_paddle())
         await first_paddle_acquired.wait()
         locator_task = asyncio.create_task(exclusive_locator())
-        await asyncio.sleep(0)
+        await asyncio.wait_for(locator_acquired.wait(), timeout=1)
         second_task = asyncio.create_task(second_paddle())
         await asyncio.sleep(0)
-        assert events == ["paddle-1"]
+        assert events == ["paddle-1", "locator"]
 
         release_first_paddle.set()
-        while events == ["paddle-1"]:
+        while events == ["paddle-1", "locator"]:
             await asyncio.sleep(0)
-        assert events == ["paddle-1", "locator"]
+        assert events == ["paddle-1", "locator", "paddle-2"]
 
         release_exclusive.set()
         await asyncio.gather(first_task, locator_task, second_task)
@@ -123,6 +125,24 @@ def test_cad_local_ocr_coordinator_prioritizes_locator_then_shares_paddle():
         await asyncio.gather(*shared_tasks)
 
     asyncio.run(scenario())
+
+
+def test_cad_indexed_no_text_retry_keeps_short_confident_thai_label():
+    candidate = {
+        "source_hint": "จุ",
+        "source_confidence": 91.0,
+    }
+
+    assert main_module._cad_indexed_read_needs_review(
+        candidate, {"source_text": "[NO_TEXT]"}
+    )
+    assert not main_module._cad_indexed_read_needs_review(
+        candidate, {"source_text": "จุ"}
+    )
+    candidate["source_confidence"] = 55.0
+    assert not main_module._cad_indexed_read_needs_review(
+        candidate, {"source_text": "[NO_TEXT]"}
+    )
 
 
 def test_slow_structured_translation_uses_delayed_hedge(monkeypatch):
@@ -3770,8 +3790,8 @@ def test_pdf_pipeline_reviews_only_unresolved_cad_candidates_at_high_resolution(
         "bbox": (40.0, 60.0, 210.0, 82.0),
         "rotation": 0,
         "vertical": False,
-        "source_hint": "",
-        "source_confidence": 0.0,
+        "source_hint": "อาคาร",
+        "source_confidence": 90.0,
     }
 
     monkeypatch.setenv("APP_CAD_OCR_MODE", "indexed")
@@ -3825,7 +3845,9 @@ def test_pdf_pipeline_reviews_only_unresolved_cad_candidates_at_high_resolution(
     async def fake_translate_indexed(content, *_args, **_kwargs):
         calls.append(content)
         if content != b"review":
-            return [], "vision"
+            # A model-level no-text answer is syntactically complete, but it
+            # contradicts the reliable Thai locator hint and must be retried.
+            return [{"id": "ID001", "source_text": "[NO_TEXT]"}], "vision"
         return (
             [
                 {

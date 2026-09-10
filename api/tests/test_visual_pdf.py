@@ -142,7 +142,37 @@ def test_paddle_runtime_kwargs_are_optional_and_bounded(monkeypatch):
 
     monkeypatch.delenv("APP_PADDLE_DEVICE")
     monkeypatch.delenv("APP_PADDLE_CPU_THREADS")
-    assert visual_pdf._paddle_runtime_kwargs() == {"enable_mkldnn": True}
+    assert visual_pdf._paddle_runtime_kwargs() == {
+        "enable_mkldnn": True,
+        "cpu_threads": max(
+            1,
+            min(
+                8,
+                (
+                    visual_pdf._CPU_COUNT - visual_pdf._CAD_TESSERACT_WORKERS
+                )
+                // visual_pdf._CAD_PADDLE_WORKERS,
+            ),
+        ),
+    }
+
+
+def test_cad_paddle_worker_recommendation_requires_cpu_and_memory_headroom():
+    gibibyte = 1024**3
+
+    assert visual_pdf._recommended_cad_paddle_workers(8, 12 * gibibyte) == 2
+    assert visual_pdf._recommended_cad_paddle_workers(7, 32 * gibibyte) == 1
+    assert visual_pdf._recommended_cad_paddle_workers(16, 11 * gibibyte) == 1
+
+
+def test_cad_paddle_worker_count_accepts_auto_and_explicit_override(monkeypatch):
+    monkeypatch.setattr(visual_pdf, "_CPU_COUNT", 8)
+    monkeypatch.setattr(visual_pdf, "_MEMORY_LIMIT_BYTES", 16 * 1024**3)
+    monkeypatch.setenv("APP_CAD_PADDLE_WORKERS", "auto")
+    assert visual_pdf.cad_paddle_worker_count() == 2
+
+    monkeypatch.setenv("APP_CAD_PADDLE_WORKERS", "9")
+    assert visual_pdf.cad_paddle_worker_count() == 4
 
 
 def test_normalize_tesseract_source_hint_joins_only_thai_gaps():
@@ -209,6 +239,7 @@ def test_tesseract_blocks_include_average_line_confidence(monkeypatch):
         ]
     )
     monkeypatch.setattr(documents.shutil, "which", lambda _name: "/usr/bin/tesseract")
+    documents._TESSERACT_LANGUAGES_BY_EXECUTABLE.clear()
     monkeypatch.setattr(documents.subprocess, "run", lambda *args, **kwargs: next(calls))
     monkeypatch.setattr(
         documents.fitz,
@@ -221,6 +252,28 @@ def test_tesseract_blocks_include_average_line_confidence(monkeypatch):
     assert len(blocks) == 1
     assert blocks[0]["source_text"] == "ราย การ"
     assert blocks[0]["confidence"] == pytest.approx(85.0)
+
+
+def test_tesseract_language_probe_is_cached(monkeypatch):
+    documents._TESSERACT_LANGUAGES_BY_EXECUTABLE.clear()
+    calls = []
+
+    def fake_run(*_args, **_kwargs):
+        calls.append(True)
+        return SimpleNamespace(stdout=b"List of available languages:\ntha\neng\n")
+
+    monkeypatch.setattr(documents.subprocess, "run", fake_run)
+
+    assert documents._available_tesseract_languages("/usr/bin/tesseract") == {
+        "List",
+        "of",
+        "available",
+        "languages:",
+        "tha",
+        "eng",
+    }
+    assert documents._available_tesseract_languages("/usr/bin/tesseract")
+    assert len(calls) == 1
 
 
 def test_paddle_cad_detector_uses_geometry_without_local_transcription(monkeypatch):
