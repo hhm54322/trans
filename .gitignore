@@ -6,6 +6,7 @@ AccessKey.csv
 .venv/
 __pycache__/
 .pytest_cache/
+paddle-cache/
 *.pyc
 *.log
 *.db
