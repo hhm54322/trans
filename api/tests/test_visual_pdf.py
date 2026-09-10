@@ -240,6 +240,18 @@ def test_cad_paddle_worker_count_accepts_auto_and_explicit_override(monkeypatch)
     assert visual_pdf.cad_paddle_worker_count() == 4
 
 
+def test_cad_tesseract_worker_count_accepts_auto_and_explicit_override(monkeypatch):
+    monkeypatch.setattr(visual_pdf, "_CPU_COUNT", 8)
+    monkeypatch.setenv("APP_CAD_TESSERACT_WORKERS", "auto")
+    assert visual_pdf.cad_tesseract_worker_count() == 4
+
+    monkeypatch.setenv("APP_CAD_TESSERACT_WORKERS", "2")
+    assert visual_pdf.cad_tesseract_worker_count() == 2
+
+    monkeypatch.setenv("APP_CAD_TESSERACT_WORKERS", "9")
+    assert visual_pdf.cad_tesseract_worker_count() == 4
+
+
 def test_normalize_tesseract_source_hint_joins_only_thai_gaps():
     assert visual_pdf._normalize_tesseract_source_hint(
         "  ร า ย ก า ร   ABC 123  "

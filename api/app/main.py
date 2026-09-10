@@ -1931,6 +1931,14 @@ async def _translate_pdf_document_pipeline(
                     if not candidates:
                         return []
                     review_page_png = await get_review_page_png()
+                    review_prepare_started_at = monotonic()
+                    _log_document_event(
+                        "cad_review_sheets_prepare_started",
+                        filename=filename,
+                        page_number=page_number,
+                        stage="CAD 高清复核",
+                        candidate_count=len(candidates),
+                    )
 
                     def prepare_unresolved_review_sheets():
                         document = fitz.open(stream=content, filetype="pdf")
@@ -1947,6 +1955,17 @@ async def _translate_pdf_document_pipeline(
 
                     unresolved_sheets = await loop.run_in_executor(
                         None, prepare_unresolved_review_sheets
+                    )
+                    _log_document_event(
+                        "cad_review_sheets_prepare_completed",
+                        filename=filename,
+                        page_number=page_number,
+                        stage="CAD 高清复核",
+                        candidate_count=len(candidates),
+                        sheet_count=len(unresolved_sheets),
+                        elapsed_ms=round(
+                            (monotonic() - review_prepare_started_at) * 1000
+                        ),
                     )
                     numbered_unresolved_sheets = [
                         (sheet_number, sheet)
@@ -2083,6 +2102,14 @@ async def _translate_pdf_document_pipeline(
 
                 if paddle_only_candidates:
                     review_page_png = await get_review_page_png()
+                    paddle_prepare_started_at = monotonic()
+                    _log_document_event(
+                        "cad_review_sheets_prepare_started",
+                        filename=filename,
+                        page_number=page_number,
+                        stage="CAD Paddle 补漏",
+                        candidate_count=len(paddle_only_candidates),
+                    )
 
                     def prepare_paddle_review_sheets():
                         document = fitz.open(stream=content, filetype="pdf")
@@ -2099,6 +2126,17 @@ async def _translate_pdf_document_pipeline(
 
                     paddle_sheets = await loop.run_in_executor(
                         None, prepare_paddle_review_sheets
+                    )
+                    _log_document_event(
+                        "cad_review_sheets_prepare_completed",
+                        filename=filename,
+                        page_number=page_number,
+                        stage="CAD Paddle 补漏",
+                        candidate_count=len(paddle_only_candidates),
+                        sheet_count=len(paddle_sheets),
+                        elapsed_ms=round(
+                            (monotonic() - paddle_prepare_started_at) * 1000
+                        ),
                     )
                     (
                         vision_paddle_sheets,

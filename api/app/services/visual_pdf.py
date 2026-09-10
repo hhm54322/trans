@@ -112,12 +112,21 @@ def cad_paddle_worker_count() -> int:
     return max(1, min(4, int(configured)))
 
 
+def cad_tesseract_worker_count() -> int:
+    """Keep every OCR pass while allowing CPU-constrained deployments to pace them."""
+
+    configured = os.getenv("APP_CAD_TESSERACT_WORKERS", "auto").strip().lower()
+    if not configured or configured == "auto":
+        return max(1, min(4, _CPU_COUNT // 2))
+    return max(1, min(4, int(configured)))
+
+
 # Reserve roughly half of the detected CPU capacity for Paddle while it runs
 # beside Tesseract. This is based on the container's runtime resources rather
 # than a developer workstation and keeps low-core hosts from oversubscribing.
 _CPU_COUNT = _runtime_cpu_count()
 _MEMORY_LIMIT_BYTES = _runtime_memory_limit_bytes()
-_CAD_TESSERACT_WORKERS = max(1, min(4, _CPU_COUNT // 2))
+_CAD_TESSERACT_WORKERS = cad_tesseract_worker_count()
 _CAD_PADDLE_WORKERS = cad_paddle_worker_count()
 _CAD_TESSERACT_SEMAPHORE = threading.BoundedSemaphore(_CAD_TESSERACT_WORKERS)
 # Dense architectural sheets are frequently A1 or larger. Passing their
