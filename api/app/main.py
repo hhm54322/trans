@@ -112,12 +112,16 @@ CAD_PADDLE_DETECTOR_ROWS_PER_SHEET = 12
 CAD_INDEXED_IMAGES_PER_REQUEST = max(
     1, min(4, int(os.getenv("APP_CAD_INDEXED_IMAGES_PER_REQUEST", "3")))
 )
-# Focused review sheets contain only three enlarged rows. Four images expose
-# 12 unchanged rows without crossing the deployed gateway's long-tail cliff.
+# Focused review sheets default to three enlarged rows. Four images expose
+# 12 unchanged rows without crossing the deployed gateway's long-tail cliff;
+# production benchmarks may opt into four rows without resizing the crops.
 # Missing IDs are retried as exact row subsets and a rejected group is split
 # recursively before the final independent-sheet fallback.
 CAD_REVIEW_IMAGES_PER_REQUEST = max(
     1, min(4, int(os.getenv("APP_CAD_REVIEW_IMAGES_PER_REQUEST", "4")))
+)
+CAD_REVIEW_ROWS_PER_SHEET = max(
+    1, min(4, int(os.getenv("APP_CAD_REVIEW_ROWS_PER_SHEET", "3")))
 )
 # Indexed sheets retain their original rendering density. A request may carry
 # several separate sheets, but no sheet is stitched, resized or recompressed.
@@ -1953,7 +1957,7 @@ async def _translate_pdf_document_pipeline(
                                 document[page_number - 1],
                                 candidates,
                                 desired_width=6400,
-                                rows_per_sheet=3,
+                                rows_per_sheet=CAD_REVIEW_ROWS_PER_SHEET,
                                 rendered_page_png=review_page_png,
                             )
                         finally:
@@ -2124,7 +2128,7 @@ async def _translate_pdf_document_pipeline(
                                 document[page_number - 1],
                                 paddle_only_candidates,
                                 desired_width=6400,
-                                rows_per_sheet=3,
+                                rows_per_sheet=CAD_REVIEW_ROWS_PER_SHEET,
                                 rendered_page_png=review_page_png,
                             )
                         finally:
