@@ -237,7 +237,6 @@ class _CadLocalOcrCoordinator:
 
     def __init__(self, paddle_limit: int):
         self._condition = asyncio.Condition()
-        self._review_semaphore = asyncio.Semaphore(1)
         self._paddle_limit = max(1, int(paddle_limit))
         self._exclusive_active = False
         self._active_paddles = 0
@@ -267,13 +266,6 @@ class _CadLocalOcrCoordinator:
             async with self._condition:
                 self._active_paddles -= 1
                 self._condition.notify_all()
-
-    @asynccontextmanager
-    async def review_preparation(self):
-        """Serialize memory-heavy lossless sheet builds across active jobs."""
-
-        async with self._review_semaphore:
-            yield
 
 
 class _CadTextTranslationCache:
@@ -1286,64 +1278,33 @@ async def _translate_pdf_document_pipeline(
 
                 async def locate_raw_paddle_candidates_once():
                     queue_started_at = monotonic()
-                    try:
-                        async with cad_local_ocr.paddle():
-                            worker_started_at = monotonic()
-                            _log_document_event(
-                                "cad_paddle_worker_started",
-                                filename=filename,
-                                page_number=page_number,
-                                queue_ms=round(
-                                    (worker_started_at - queue_started_at) * 1000
-                                ),
-                                worker_limit=CAD_PADDLE_WORKERS,
-                            )
-                            candidates = await loop.run_in_executor(
-                                _cad_paddle_executor,
-                                locate_raw_paddle_candidates,
-                            )
-                            _log_document_event(
-                                "cad_paddle_worker_completed",
-                                filename=filename,
-                                page_number=page_number,
-                                candidate_count=len(candidates),
-                                inference_ms=round(
-                                    (monotonic() - worker_started_at) * 1000
-                                ),
-                            )
-                            if not paddle_result_future.done():
-                                paddle_result_future.set_result(candidates)
-                            # If this page is already waiting for Paddle, retain
-                            # its worker lane through the short local sheet build.
-                            # That prevents the next full-page predictor from
-                            # starving the completed page's CPU-bound handoff.
-                            await asyncio.sleep(0)
-                            if paddle_review_requested.is_set():
-                                handoff_started_at = monotonic()
-                                _log_document_event(
-                                    "cad_paddle_worker_handoff_started",
-                                    filename=filename,
-                                    page_number=page_number,
-                                )
-                                await paddle_review_prepared.wait()
-                                _log_document_event(
-                                    "cad_paddle_worker_handoff_completed",
-                                    filename=filename,
-                                    page_number=page_number,
-                                    elapsed_ms=round(
-                                        (monotonic() - handoff_started_at) * 1000
-                                    ),
-                                )
-                            return candidates
-                    except BaseException as exc:
-                        if not paddle_result_future.done():
-                            paddle_result_future.set_exception(exc)
-                        raise
+                    async with cad_local_ocr.paddle():
+                        worker_started_at = monotonic()
+                        _log_document_event(
+                            "cad_paddle_worker_started",
+                            filename=filename,
+                            page_number=page_number,
+                            queue_ms=round(
+                                (worker_started_at - queue_started_at) * 1000
+                            ),
+                            worker_limit=CAD_PADDLE_WORKERS,
+                        )
+                        candidates = await loop.run_in_executor(
+                            _cad_paddle_executor,
+                            locate_raw_paddle_candidates,
+                        )
+                        _log_document_event(
+                            "cad_paddle_worker_completed",
+                            filename=filename,
+                            page_number=page_number,
+                            candidate_count=len(candidates),
+                            inference_ms=round(
+                                (monotonic() - worker_started_at) * 1000
+                            ),
+                        )
+                        return candidates
 
                 paddle_supplement_started_at = monotonic()
-                paddle_result_future = loop.create_future()
-                paddle_review_requested = asyncio.Event()
-                paddle_review_prepared = asyncio.Event()
                 paddle_supplement_task = asyncio.create_task(
                     locate_raw_paddle_candidates_once()
                 )
@@ -1373,7 +1334,6 @@ async def _translate_pdf_document_pipeline(
                     async with cad_local_ocr.exclusive():
                         sheets = await loop.run_in_executor(None, prepare_sheets)
                 except BaseException:
-                    paddle_review_prepared.set()
                     paddle_supplement_task.cancel()
                     await asyncio.gather(
                         paddle_supplement_task, return_exceptions=True
@@ -1993,10 +1953,9 @@ async def _translate_pdf_document_pipeline(
                         finally:
                             document.close()
 
-                    async with cad_local_ocr.review_preparation():
-                        unresolved_sheets = await loop.run_in_executor(
-                            None, prepare_unresolved_review_sheets
-                        )
+                    unresolved_sheets = await loop.run_in_executor(
+                        None, prepare_unresolved_review_sheets
+                    )
                     _log_document_event(
                         "cad_review_sheets_prepare_completed",
                         filename=filename,
@@ -2102,14 +2061,7 @@ async def _translate_pdf_document_pipeline(
                         f"正在流水线复核 CAD 漏检文字（第 {page_number} 页）",
                     )
                 paddle_wait_started_at = monotonic()
-                paddle_review_requested.set()
-                try:
-                    raw_paddle_candidates = await paddle_result_future
-                except BaseException:
-                    await asyncio.gather(
-                        paddle_supplement_task, return_exceptions=True
-                    )
-                    raise
+                raw_paddle_candidates = await paddle_supplement_task
                 _log_document_event(
                     "cad_paddle_supplement_completed",
                     filename=filename,
@@ -2148,53 +2100,44 @@ async def _translate_pdf_document_pipeline(
                     paddle_only_candidates.append(candidate)
                     paddle_replacement_candidate_count += 1
 
-                if not paddle_only_candidates:
-                    paddle_review_prepared.set()
-                    await paddle_supplement_task
-
                 if paddle_only_candidates:
-                    try:
-                        review_page_png = await get_review_page_png()
-                        paddle_prepare_started_at = monotonic()
-                        _log_document_event(
-                            "cad_review_sheets_prepare_started",
-                            filename=filename,
-                            page_number=page_number,
-                            stage="CAD Paddle 补漏",
-                            candidate_count=len(paddle_only_candidates),
-                        )
+                    review_page_png = await get_review_page_png()
+                    paddle_prepare_started_at = monotonic()
+                    _log_document_event(
+                        "cad_review_sheets_prepare_started",
+                        filename=filename,
+                        page_number=page_number,
+                        stage="CAD Paddle 补漏",
+                        candidate_count=len(paddle_only_candidates),
+                    )
 
-                        def prepare_paddle_review_sheets():
-                            document = fitz.open(stream=content, filetype="pdf")
-                            try:
-                                return prepare_dense_cad_review_sheets(
-                                    document[page_number - 1],
-                                    paddle_only_candidates,
-                                    desired_width=6400,
-                                    rows_per_sheet=3,
-                                    rendered_page_png=review_page_png,
-                                )
-                            finally:
-                                document.close()
-
-                        async with cad_local_ocr.review_preparation():
-                            paddle_sheets = await loop.run_in_executor(
-                                None, prepare_paddle_review_sheets
+                    def prepare_paddle_review_sheets():
+                        document = fitz.open(stream=content, filetype="pdf")
+                        try:
+                            return prepare_dense_cad_review_sheets(
+                                document[page_number - 1],
+                                paddle_only_candidates,
+                                desired_width=6400,
+                                rows_per_sheet=3,
+                                rendered_page_png=review_page_png,
                             )
-                        _log_document_event(
-                            "cad_review_sheets_prepare_completed",
-                            filename=filename,
-                            page_number=page_number,
-                            stage="CAD Paddle 补漏",
-                            candidate_count=len(paddle_only_candidates),
-                            sheet_count=len(paddle_sheets),
-                            elapsed_ms=round(
-                                (monotonic() - paddle_prepare_started_at) * 1000
-                            ),
-                        )
-                    finally:
-                        paddle_review_prepared.set()
-                        await paddle_supplement_task
+                        finally:
+                            document.close()
+
+                    paddle_sheets = await loop.run_in_executor(
+                        None, prepare_paddle_review_sheets
+                    )
+                    _log_document_event(
+                        "cad_review_sheets_prepare_completed",
+                        filename=filename,
+                        page_number=page_number,
+                        stage="CAD Paddle 补漏",
+                        candidate_count=len(paddle_only_candidates),
+                        sheet_count=len(paddle_sheets),
+                        elapsed_ms=round(
+                            (monotonic() - paddle_prepare_started_at) * 1000
+                        ),
+                    )
                     (
                         vision_paddle_sheets,
                         paddle_cached_rows,

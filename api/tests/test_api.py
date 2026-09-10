@@ -127,36 +127,6 @@ def test_cad_local_ocr_coordinator_overlaps_locator_with_bounded_paddle():
     asyncio.run(scenario())
 
 
-def test_cad_local_ocr_coordinator_serializes_review_sheet_preparation():
-    async def scenario():
-        coordinator = main_module._CadLocalOcrCoordinator(2)
-        first_acquired = asyncio.Event()
-        release_first = asyncio.Event()
-        active = 0
-        maximum_active = 0
-
-        async def prepare(*, first=False):
-            nonlocal active, maximum_active
-            async with coordinator.review_preparation():
-                active += 1
-                maximum_active = max(maximum_active, active)
-                if first:
-                    first_acquired.set()
-                    await release_first.wait()
-                active -= 1
-
-        first_task = asyncio.create_task(prepare(first=True))
-        await first_acquired.wait()
-        second_task = asyncio.create_task(prepare())
-        await asyncio.sleep(0)
-        assert maximum_active == 1
-        release_first.set()
-        await asyncio.gather(first_task, second_task)
-        assert maximum_active == 1
-
-    asyncio.run(scenario())
-
-
 def test_cad_text_translation_cache_coalesces_inflight_and_resolved_values():
     async def scenario():
         cache = main_module._CadTextTranslationCache()
