@@ -1827,6 +1827,7 @@ def filter_dense_cad_paddle_candidates(
     *,
     existing_bboxes: Optional[Sequence[Sequence[float]]] = None,
     page_rotation: int = 0,
+    include_existing_matches: bool = False,
 ) -> List[Dict[str, Any]]:
     """Apply the indexed-candidate overlap rule after Paddle detection.
 
@@ -1834,6 +1835,9 @@ def filter_dense_cad_paddle_candidates(
     run while Tesseract creates indexed candidates. The logic is identical to
     the original in-loop comparison and remains the sole authority on whether
     a Paddle candidate is new or merely provides a larger cover rectangle.
+    Indexed CAD may request every existing match so its tighter Paddle crop can
+    replace a noisy Tesseract crop after a successful visual read.  Other
+    callers retain the original supplement-only behavior by default.
     """
     covered_rects = [fitz.Rect(values) for values in existing_bboxes or []]
     filtered = []
@@ -1844,9 +1848,10 @@ def filter_dense_cad_paddle_candidates(
             page_rect, covered_rects, page_rotation
         )
         if matching_existing_index is not None:
-            if not materially_larger:
+            if not materially_larger and not include_existing_matches:
                 continue
             candidate["matching_existing_index"] = matching_existing_index
+            candidate["materially_larger_than_existing"] = materially_larger
         filtered.append(candidate)
     return _deduplicate_page_candidates(filtered)
 

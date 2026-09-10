@@ -4052,6 +4052,107 @@ def test_pdf_pipeline_adds_uncovered_paddle_cad_text_to_translation(monkeypatch)
     assert recovered["metadata"]["ocr_provider"] == "paddle-full-page"
 
 
+@pytest.mark.parametrize(
+    ("paddle_text", "expected_source", "expected_provider"),
+    [
+        ("อาคาร", "อาคาร", "paddle-full-page"),
+        ("[NO_TEXT]", "ข้อความผิด", "gpt-indexed-source"),
+    ],
+)
+def test_pdf_pipeline_uses_paddle_match_only_after_successful_read(
+    monkeypatch, paddle_text, expected_source, expected_provider
+):
+    content = make_pdf(["CAD"])
+    page = ParsedPdfPage(
+        page_number=1,
+        text="",
+        segments=[],
+        page_type="vector",
+        profile={"drawing_count": 50_000, "visual_required": True},
+    )
+    tesseract_candidate = {
+        "bbox": (40.0, 60.0, 150.0, 82.0),
+        "rotation": 0,
+        "vertical": False,
+        "source_hint": "ข้อความผิด",
+        "source_confidence": 90.0,
+    }
+    paddle_candidate = {
+        "bbox": (42.0, 61.0, 148.0, 81.0),
+        "rotation": 0,
+        "vertical": False,
+        "source_hint": "อาคาร",
+        "source_confidence": 96.0,
+        "candidate_provider": "paddle-full-page",
+    }
+
+    monkeypatch.setenv("APP_CAD_OCR_MODE", "auto")
+    monkeypatch.setattr(main_module, "iter_pdf_pages", lambda _: iter([page]))
+    monkeypatch.setattr(main_module.translator, "provider", object())
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_translation_sheets",
+        lambda *_args, **_kwargs: [
+            {
+                "content": b"tesseract",
+                "entries": {"ID001": tesseract_candidate},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "detect_dense_cad_paddle_candidates",
+        lambda *_args, **_kwargs: [paddle_candidate],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "prepare_dense_cad_review_sheets",
+        lambda _page, candidates, **_kwargs: [
+            {"content": b"paddle", "entries": {"PID001": candidates[0]}}
+        ],
+    )
+
+    async def fake_read_indexed(image, *_args, **_kwargs):
+        if image == b"tesseract":
+            return ([{"id": "ID001", "source_text": "ข้อความผิด"}], "vision")
+        assert image == b"paddle"
+        return ([{"id": "PID001", "source_text": paddle_text}], "vision-paddle")
+
+    translated_sources = []
+
+    async def fake_translate_segments(segments, *_args, **_kwargs):
+        translated_sources.extend(segment.text for segment in segments)
+        return ({segment.segment_id: "建筑" for segment in segments}, ["text"], [])
+
+    monkeypatch.setattr(
+        main_module.translator,
+        "read_indexed_image_lines",
+        fake_read_indexed,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_translate_document_segments",
+        fake_translate_segments,
+    )
+
+    source_text, result = asyncio.run(
+        main_module._translate_pdf_document_pipeline(
+            content, "cad.pdf", 1, "th", "zh", ""
+        )
+    )
+
+    assert source_text == expected_source
+    assert translated_sources == [expected_source]
+    assert len(result.layout_segments) == 1
+    expected_bbox = (
+        paddle_candidate["bbox"]
+        if paddle_text != "[NO_TEXT]"
+        else tesseract_candidate["bbox"]
+    )
+    assert result.layout_segments[0]["bbox"] == expected_bbox
+    assert result.layout_segments[0]["metadata"]["ocr_provider"] == expected_provider
+
+
 async def _fake_two_stage_cad_text_translation(segments, *_args, **_kwargs):
     return (
         {

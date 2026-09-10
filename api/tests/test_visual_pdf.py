@@ -1008,6 +1008,29 @@ def test_deferred_paddle_candidate_filter_matches_inline_result(monkeypatch):
     assert deferred == inline
 
 
+def test_deferred_paddle_filter_can_return_existing_match_for_crop_replacement():
+    candidates = [
+        {
+            "bbox": (20.0, 20.0, 130.0, 40.0),
+            "rotation": 0,
+            "vertical": False,
+            "source_hint": "ผนัง",
+            "source_confidence": 95.0,
+        }
+    ]
+
+    filtered = visual_pdf.filter_dense_cad_paddle_candidates(
+        candidates,
+        existing_bboxes=[(18.0, 18.0, 132.0, 42.0)],
+        page_rotation=0,
+        include_existing_matches=True,
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0]["matching_existing_index"] == 0
+    assert filtered[0]["materially_larger_than_existing"] is False
+
+
 def test_selective_paddle_recognizes_only_new_or_larger_geometry(monkeypatch):
     polygons = [
         [[20, 20], [130, 20], [130, 40], [20, 40]],

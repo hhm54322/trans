@@ -1342,6 +1342,14 @@ async def _translate_pdf_document_pipeline(
                 indexed_sheets = [
                     sheet for sheet in sheets if sheet.get("entries")
                 ]
+                # Keep a stable identity through cache subsetting/repacking and
+                # high-resolution review. Paddle can then replace one noisy
+                # Tesseract crop only after its own focused read succeeds.
+                for sheet_index, sheet in enumerate(indexed_sheets):
+                    for item_id, candidate in sheet["entries"].items():
+                        candidate.setdefault(
+                            "origin_item_id", f"{sheet_index}:{item_id}"
+                        )
                 supplemental_segments = [
                     DocumentSegment(**unit)
                     for sheet in sheets
@@ -1982,17 +1990,27 @@ async def _translate_pdf_document_pipeline(
                     raw_paddle_candidates,
                     existing_bboxes=existing_bboxes,
                     page_rotation=page_rotation,
+                    include_existing_matches=True,
                 )
                 paddle_only_candidates = []
+                paddle_replacement_candidate_count = 0
+                paddle_replaced_count = 0
+                paddle_added_count = 0
                 for candidate in paddle_candidates:
                     matching_index = candidate.get("matching_existing_index")
                     if matching_index is None:
                         paddle_only_candidates.append(candidate)
                         continue
-                    source_sheet, source_item_id = existing_refs[int(matching_index)]
-                    source_candidate = source_sheet["entries"][source_item_id]
-                    source_candidate["bbox"] = tuple(candidate["bbox"])
-                    source_candidate["cover_bbox"] = tuple(candidate["bbox"])
+                    _source_sheet, source_item_id = existing_refs[
+                        int(matching_index)
+                    ]
+                    source_candidate = _source_sheet["entries"][source_item_id]
+                    candidate["replaces_origin_item_id"] = source_candidate[
+                        "origin_item_id"
+                    ]
+                    candidate["cover_bbox"] = tuple(candidate["bbox"])
+                    paddle_only_candidates.append(candidate)
+                    paddle_replacement_candidate_count += 1
 
                 if paddle_only_candidates:
                     review_page_png = await get_review_page_png()
@@ -2092,14 +2110,46 @@ async def _translate_pdf_document_pipeline(
                         paddle_recognized_rows.extend(waiter_review_rows)
                         await cad_visual_source_cache.remember(waiter_review_rows)
                     paddle_cached_rows.extend(paddle_coalesced_rows)
-                    recognized_rows.extend(
-                        _commit_and_expand_cad_source_cache(
-                            paddle_recognized_rows,
-                            paddle_cached_rows,
-                            paddle_duplicate_rows,
-                            cad_visual_source_cache.values,
+                    merged_paddle_rows = _commit_and_expand_cad_source_cache(
+                        paddle_recognized_rows,
+                        paddle_cached_rows,
+                        paddle_duplicate_rows,
+                        cad_visual_source_cache.values,
+                    )
+                    replaced_origin_ids = {
+                        str(candidate.get("replaces_origin_item_id"))
+                        for candidate, item in merged_paddle_rows
+                        if candidate.get("replaces_origin_item_id")
+                        and re.search(
+                            r"[\u0E00-\u0E7F]",
+                            str(item.get("source_text") or ""),
+                        )
+                    }
+                    paddle_replaced_count = len(replaced_origin_ids)
+                    paddle_added_count = sum(
+                        1
+                        for candidate, item in merged_paddle_rows
+                        if not candidate.get("replaces_origin_item_id")
+                        and re.search(
+                            r"[\u0E00-\u0E7F]",
+                            str(item.get("source_text") or ""),
                         )
                     )
+                    if replaced_origin_ids:
+                        recognized_rows = [
+                            (candidate, item)
+                            for candidate, item in recognized_rows
+                            if str(candidate.get("origin_item_id") or "")
+                            not in replaced_origin_ids
+                        ]
+                        _log_document_event(
+                            "cad_paddle_existing_candidate_replaced",
+                            filename=filename,
+                            page_number=page_number,
+                            candidate_count=len(replaced_origin_ids),
+                            attempted_count=paddle_replacement_candidate_count,
+                        )
+                    recognized_rows.extend(merged_paddle_rows)
 
                 unique_segments = []
                 translation_segment_by_source = {}
@@ -2273,10 +2323,12 @@ async def _translate_pdf_document_pipeline(
                         f"第 {page_number} 页复用 {repeated_source_count} 个"
                         "页内完全相同的 CAD 原文译文"
                     )
-                if paddle_only_candidates:
+                if paddle_added_count or paddle_replaced_count:
                     page_warnings.append(
                         f"第 {page_number} 页 Paddle 补回 "
-                        f"{len(paddle_only_candidates)} 个 CAD 文字候选"
+                        f"{paddle_added_count} 个 CAD 文字候选，"
+                        f"校正 {paddle_replaced_count} 个"
+                        " Tesseract 候选框"
                     )
                 provider = "+".join(
                     _unique_provider_names([*reader_providers, *text_providers])
