@@ -112,16 +112,17 @@ CAD_PADDLE_DETECTOR_ROWS_PER_SHEET = 12
 CAD_INDEXED_IMAGES_PER_REQUEST = max(
     1, min(4, int(os.getenv("APP_CAD_INDEXED_IMAGES_PER_REQUEST", "3")))
 )
-# Focused review sheets default to three enlarged rows. Four images expose
-# 12 unchanged rows without crossing the deployed gateway's long-tail cliff;
-# production benchmarks may opt into four rows without resizing the crops.
+# Focused review sheets default to four enlarged rows. The deployed gateway
+# returned every indexed row in the four-page CAD benchmark while reducing
+# requests by roughly one quarter. Five and six rows remain opt-in so larger
+# batches must pass the same no-loss production check before becoming default.
 # Missing IDs are retried as exact row subsets and a rejected group is split
 # recursively before the final independent-sheet fallback.
 CAD_REVIEW_IMAGES_PER_REQUEST = max(
     1, min(4, int(os.getenv("APP_CAD_REVIEW_IMAGES_PER_REQUEST", "4")))
 )
 CAD_REVIEW_ROWS_PER_SHEET = max(
-    1, min(4, int(os.getenv("APP_CAD_REVIEW_ROWS_PER_SHEET", "3")))
+    1, min(6, int(os.getenv("APP_CAD_REVIEW_ROWS_PER_SHEET", "4")))
 )
 # Indexed sheets retain their original rendering density. A request may carry
 # several separate sheets, but no sheet is stitched, resized or recompressed.
