@@ -13,7 +13,10 @@ import type {
 const apiBase = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, init)
+  const response = await fetch(`${apiBase}${path}`, {
+    credentials: 'include',
+    ...init,
+  })
   if (!response.ok) {
     let message = `请求失败 (${response.status})`
     try {

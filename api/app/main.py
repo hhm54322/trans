@@ -19,9 +19,9 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable, Dict, List, Optional
 from urllib.parse import quote
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -172,6 +172,8 @@ LAYOUT_TRANSLATION_CONCURRENCY = max(
     ),
 )
 DOCUMENT_JOB_TTL_SECONDS = 3600
+CLIENT_ID_COOKIE = "metatrans_client_id"
+CLIENT_ID_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
 KNOWLEDGE_IMPORT_MAX_ROWS = 10000
 KNOWLEDGE_CONTEXT_MAX_CHARACTERS = 4000
 # Visual processing is selected per page. This keeps plain text PDFs on the
@@ -186,6 +188,7 @@ ProgressCallback = Optional[Callable[[int, str], None]]
 class DocumentJobState:
     job_id: str
     total_pages: int
+    owner_id: str
     diagnostic_id: str = ""
     completed_pages: int = 0
     status: str = "processing"
@@ -581,6 +584,42 @@ app.add_middleware(
 )
 
 
+def _normalized_client_id(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        return str(UUID(value))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _request_owner_id(request: Request) -> str:
+    owner_id = getattr(request.state, "owner_id", None)
+    if not owner_id:
+        raise RuntimeError("请求缺少客户端身份")
+    return owner_id
+
+
+@app.middleware("http")
+async def assign_client_identity(request: Request, call_next):
+    cookie_id = _normalized_client_id(request.cookies.get(CLIENT_ID_COOKIE))
+    owner_id = cookie_id or str(uuid4())
+    request.state.owner_id = owner_id
+    response = await call_next(request)
+    if cookie_id != owner_id:
+        forwarded_proto = request.headers.get("x-forwarded-proto", "")
+        response.set_cookie(
+            CLIENT_ID_COOKIE,
+            owner_id,
+            max_age=CLIENT_ID_MAX_AGE_SECONDS,
+            httponly=True,
+            secure=request.url.scheme == "https" or forwarded_proto == "https",
+            samesite="lax",
+            path="/",
+        )
+    return response
+
+
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     provider = "demo" if isinstance(translator.provider, DemoProvider) else "openai"
@@ -588,7 +627,7 @@ async def health() -> HealthResponse:
 
 
 @app.post("/api/translate", response_model=TranslationResponse)
-async def translate_text(payload: TranslationRequest) -> TranslationResponse:
+async def translate_text(payload: TranslationRequest, request: Request) -> TranslationResponse:
     try:
         result = await _translate_text_with_knowledge(
             payload.text,
@@ -601,6 +640,7 @@ async def translate_text(payload: TranslationRequest) -> TranslationResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
     return _save_result(
+        owner_id=_request_owner_id(request),
         kind="text",
         source_text=payload.text,
         target_language=payload.target_language,
@@ -610,6 +650,7 @@ async def translate_text(payload: TranslationRequest) -> TranslationResponse:
 
 @app.post("/api/translate/image", response_model=TranslationResponse)
 async def translate_image(
+    request: Request,
     file: UploadFile = File(...),
     source_language: str = Form("auto"),
     target_language: str = Form(...),
@@ -631,6 +672,7 @@ async def translate_image(
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return _save_result(
+        owner_id=_request_owner_id(request),
         kind="image",
         source_text=source_text,
         target_language=target_language,
@@ -641,6 +683,7 @@ async def translate_image(
 
 @app.post("/api/translate/document", response_model=TranslationResponse)
 async def translate_document(
+    request: Request,
     file: UploadFile = File(...),
     source_language: str = Form("auto"),
     target_language: str = Form(...),
@@ -653,6 +696,7 @@ async def translate_document(
     content = await _read_upload(file)
     attempt_id = str(uuid4())
     await _create_document_attempt(
+        owner_id=_request_owner_id(request),
         attempt_id=attempt_id,
         filename=filename,
         content_type=file.content_type or "",
@@ -671,6 +715,7 @@ async def translate_document(
             context,
         )
         response = await _save_document_result(
+            owner_id=_request_owner_id(request),
             kind="document",
             source_text=source_text,
             target_language=target_language,
@@ -712,6 +757,7 @@ async def translate_document(
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_document_job(
+    request: Request,
     file: UploadFile = File(...),
     source_language: str = Form("auto"),
     target_language: str = Form(...),
@@ -724,6 +770,7 @@ async def create_document_job(
     content = await _read_upload(file)
     job_id = str(uuid4())
     archived = await _create_document_attempt(
+        owner_id=_request_owner_id(request),
         attempt_id=job_id,
         filename=filename,
         content_type=file.content_type or "",
@@ -760,6 +807,7 @@ async def create_document_job(
     job = DocumentJobState(
         job_id=job_id,
         total_pages=total_pages,
+        owner_id=_request_owner_id(request),
         diagnostic_id=job_id,
         completed_pages=completed_pages,
         updated_at=monotonic(),
@@ -795,10 +843,10 @@ async def create_document_job(
     "/api/translate/document/jobs/{job_id}",
     response_model=DocumentJobResponse,
 )
-async def get_document_job(job_id: str) -> DocumentJobResponse:
+async def get_document_job(job_id: str, request: Request) -> DocumentJobResponse:
     _prune_document_jobs()
     job = document_jobs.get(job_id)
-    if job is None:
+    if job is None or job.owner_id != _request_owner_id(request):
         raise HTTPException(status_code=404, detail="文档翻译任务不存在或已过期")
     return _document_job_response(job)
 
@@ -884,6 +932,7 @@ async def _run_document_job(
             elapsed_ms=round((job.updated_at - started_at) * 1000),
         )
         job.result = await _save_document_result(
+            owner_id=job.owner_id,
             kind="document",
             source_text=source_text,
             target_language=target_language,
@@ -5911,16 +5960,24 @@ def _split_page_translations(text: str) -> Dict[int, str]:
 
 
 @app.get("/api/history", response_model=List[TranslationResponse])
-async def list_history(limit: int = Query(30, ge=1, le=100)) -> List[TranslationResponse]:
-    return [TranslationResponse(**item) for item in database.list_history(limit)]
+async def list_history(
+    request: Request,
+    limit: int = Query(30, ge=1, le=100),
+) -> List[TranslationResponse]:
+    owner_id = _request_owner_id(request)
+    return [
+        TranslationResponse(**item)
+        for item in database.list_history(owner_id, limit)
+    ]
 
 
 @app.get("/api/history/{item_id}/export")
 async def download_history_export(
     item_id: str,
+    request: Request,
     inline: bool = Query(False),
 ):
-    item = database.get_history(item_id)
+    item = database.get_history(item_id, _request_owner_id(request))
     if item is None:
         raise HTTPException(status_code=404, detail="翻译记录不存在")
     export_filename = item.get("export_filename")
@@ -5957,8 +6014,8 @@ async def download_history_export(
 
 
 @app.get("/api/history/{item_id}/export/text")
-async def download_history_text_export(item_id: str):
-    item = database.get_history(item_id)
+async def download_history_text_export(item_id: str, request: Request):
+    item = database.get_history(item_id, _request_owner_id(request))
     if item is None:
         raise HTTPException(status_code=404, detail="翻译记录不存在")
     source_filename = item.get("filename") or "translation"
@@ -5981,9 +6038,10 @@ async def download_history_text_export(item_id: str):
 @app.get("/api/history/{item_id}/export/unformatted")
 def download_history_unformatted_export(
     item_id: str,
+    request: Request,
     inline: bool = Query(False),
 ):
-    item = database.get_history(item_id)
+    item = database.get_history(item_id, _request_owner_id(request))
     if item is None:
         raise HTTPException(status_code=404, detail="翻译记录不存在")
     source_filename = item.get("filename")
@@ -6106,6 +6164,7 @@ async def upsert_knowledge_entry(
 
 def _save_result(
     *,
+    owner_id: str,
     kind: str,
     source_text: str,
     target_language: str,
@@ -6114,6 +6173,7 @@ def _save_result(
 ) -> TranslationResponse:
     item = database.add_history(
         {
+            "owner_id": owner_id,
             "kind": kind,
             "source_language": result.source_language,
             "target_language": target_language,
@@ -6129,6 +6189,7 @@ def _save_result(
 
 async def _save_document_result(
     *,
+    owner_id: str,
     kind: str,
     source_text: str,
     target_language: str,
@@ -6137,6 +6198,7 @@ async def _save_document_result(
     source_content: bytes,
 ) -> TranslationResponse:
     response = _save_result(
+        owner_id=owner_id,
         kind=kind,
         source_text=source_text,
         target_language=target_language,
@@ -6339,6 +6401,7 @@ def _export_directory() -> Path:
 
 async def _create_document_attempt(
     *,
+    owner_id: str,
     attempt_id: str,
     filename: str,
     content_type: str,
@@ -6368,6 +6431,7 @@ async def _create_document_attempt(
         database.create_document_attempt(
             {
                 "id": attempt_id,
+                "owner_id": owner_id,
                 "filename": filename,
                 "content_type": content_type,
                 "source_path": archived["source_path"],

@@ -24,6 +24,7 @@ class Database:
                 """
                 CREATE TABLE IF NOT EXISTS translation_history (
                     id TEXT PRIMARY KEY,
+                    owner_id TEXT,
                     kind TEXT NOT NULL,
                     source_language TEXT NOT NULL,
                     target_language TEXT NOT NULL,
@@ -39,10 +40,18 @@ class Database:
             self._ensure_column(
                 connection, "translation_history", "export_filename", "TEXT"
             )
+            self._ensure_column(connection, "translation_history", "owner_id", "TEXT")
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_translation_history_owner_created_at
+                ON translation_history(owner_id, created_at DESC)
+                """
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS document_attempts (
                     id TEXT PRIMARY KEY,
+                    owner_id TEXT,
                     filename TEXT NOT NULL,
                     content_type TEXT NOT NULL,
                     source_path TEXT NOT NULL,
@@ -64,6 +73,7 @@ class Database:
                 )
                 """
             )
+            self._ensure_column(connection, "document_attempts", "owner_id", "TEXT")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_document_attempts_created_at
@@ -128,13 +138,14 @@ class Database:
             connection.execute(
                 """
                 INSERT INTO document_attempts
-                (id, filename, content_type, source_path, content_sha256, content_bytes,
+                (id, owner_id, filename, content_type, source_path, content_sha256, content_bytes,
                  source_language, target_language, status, stage, total_pages,
                  completed_pages, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     values["id"],
+                    values["owner_id"],
                     values["filename"],
                     values.get("content_type", ""),
                     values["source_path"],
@@ -211,12 +222,13 @@ class Database:
             connection.execute(
                 """
                 INSERT INTO translation_history
-                (id, kind, source_language, target_language, source_text, translated_text,
+                (id, owner_id, kind, source_language, target_language, source_text, translated_text,
                  provider, warnings, filename, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item_id,
+                    values["owner_id"],
                     values["kind"],
                     values["source_language"],
                     values["target_language"],
@@ -233,17 +245,26 @@ class Database:
             ).fetchone()
         return self._history_row(row)
 
-    def list_history(self, limit: int = 30) -> List[Dict[str, Any]]:
+    def list_history(self, owner_id: str, limit: int = 30) -> List[Dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM translation_history ORDER BY created_at DESC LIMIT ?", (limit,)
+                """
+                SELECT * FROM translation_history
+                WHERE owner_id = ?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (owner_id, limit),
             ).fetchall()
         return [self._history_row(row) for row in rows]
 
-    def get_history(self, item_id: str) -> Optional[Dict[str, Any]]:
+    def get_history(self, item_id: str, owner_id: str) -> Optional[Dict[str, Any]]:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM translation_history WHERE id = ?", (item_id,)
+                """
+                SELECT * FROM translation_history
+                WHERE id = ? AND owner_id = ?
+                """,
+                (item_id, owner_id),
             ).fetchone()
         return self._history_row(row) if row else None
 

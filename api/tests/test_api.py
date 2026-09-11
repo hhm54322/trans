@@ -569,6 +569,44 @@ def test_text_translation_accepts_request_context_and_saves_history():
     assert "context" not in history[0]
 
 
+def test_history_jobs_and_exports_are_isolated_by_client_cookie():
+    with TestClient(app) as owner:
+        translated = owner.post(
+            "/api/translate/document",
+            data={"source_language": "en", "target_language": "zh"},
+            files={"file": ("private.txt", b"Hello", "text/plain")},
+        )
+        assert translated.status_code == 200
+        item_id = translated.json()["id"]
+        assert main_module.CLIENT_ID_COOKIE in translated.headers["set-cookie"]
+        assert item_id in {item["id"] for item in owner.get("/api/history").json()}
+        assert owner.get(f"/api/history/{item_id}/export").status_code == 200
+        assert owner.get(f"/api/history/{item_id}/export/text").status_code == 200
+
+        created = owner.post(
+            "/api/translate/document/jobs",
+            data={"source_language": "en", "target_language": "zh"},
+            files={"file": ("private-job.txt", b"Hello", "text/plain")},
+        )
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert owner.get(f"/api/translate/document/jobs/{job_id}").status_code == 200
+
+        with TestClient(app) as other:
+            other_history = other.get("/api/history").json()
+            assert item_id not in {item["id"] for item in other_history}
+            assert other.get(f"/api/history/{item_id}/export").status_code == 404
+            assert other.get(f"/api/history/{item_id}/export/text").status_code == 404
+            assert (
+                other.get(f"/api/history/{item_id}/export/unformatted").status_code
+                == 404
+            )
+            assert (
+                other.get(f"/api/translate/document/jobs/{job_id}").status_code
+                == 404
+            )
+
+
 def test_image_translation_and_history():
     with TestClient(app) as client:
         response = client.post(
@@ -590,15 +628,12 @@ def test_document_translation_extracts_text():
             data={"source_language": "en", "target_language": "zh", "context": "合同"},
             files={"file": ("agreement.txt", "Hello\nThank you".encode(), "text/plain")},
         )
+        exported = client.get(f"/api/history/{response.json()['id']}/export")
 
     assert response.status_code == 200
     assert response.json()["kind"] == "document"
     assert response.json()["source_text"] == "Hello\nThank you"
     assert response.json()["export_filename"] == "agreement-译文.txt"
-
-    with TestClient(app) as client:
-        exported = client.get(f"/api/history/{response.json()['id']}/export")
-
     assert exported.status_code == 200
     assert "演示译文" in exported.text
 
@@ -1215,6 +1250,7 @@ def test_document_export_runs_outside_the_async_event_loop(monkeypatch, tmp_path
     async def save_and_observe():
         task = asyncio.create_task(
             main_module._save_document_result(
+                owner_id="00000000-0000-0000-0000-000000000001",
                 kind="document",
                 source_text="source",
                 target_language="zh",

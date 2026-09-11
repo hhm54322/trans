@@ -59,17 +59,17 @@ function reuse(item: TranslationResult) {
 
     <main class="app-main">
       <TranslationWorkbench
-        v-if="view === 'translate'"
+        v-show="view === 'translate'"
         :key="workbenchKey"
         :initial-result="reusedItem"
         @completed="handleCompleted"
       />
       <HistoryView
-        v-else-if="view === 'history'"
+        v-if="view === 'history'"
         :refresh-key="historyRefreshKey"
         @reuse="reuse"
       />
-      <KnowledgeBaseView v-else />
+      <KnowledgeBaseView v-else-if="view === 'knowledge'" />
     </main>
 
     <nav class="mobile-nav" aria-label="移动端导航">
