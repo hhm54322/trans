@@ -425,6 +425,212 @@ def test_dense_cad_translation_sheets_accept_paddle_detection(monkeypatch):
     assert candidate["source_hint"] == ""
 
 
+def test_tiled_paddle_recall_keeps_only_elongated_uncovered_geometry(monkeypatch):
+    detection_calls = iter(
+        [
+            [
+                {
+                    "rect": fitz.Rect(10, 20, 130, 40),
+                    "source_confidence": 91.0,
+                },
+                {
+                    "rect": fitz.Rect(160, 10, 180, 110),
+                    "source_confidence": 88.0,
+                },
+                {
+                    "rect": fitz.Rect(210, 100, 240, 120),
+                    "source_confidence": 99.0,
+                },
+                {
+                    "rect": fitz.Rect(260, 20, 380, 40),
+                    "source_confidence": 93.0,
+                },
+            ],
+            [],
+        ]
+    )
+    monkeypatch.setattr(
+        visual_pdf,
+        "_dense_paddle_detection_seeds",
+        lambda _image: next(detection_calls),
+    )
+    document = fitz.open(stream=_blank_pdf(width=420, height=300), filetype="pdf")
+    try:
+        candidates = visual_pdf.detect_dense_cad_paddle_recall_candidates(
+            document[0],
+            desired_width=420,
+            native_units=[{"bbox": (255, 15, 385, 45)}],
+        )
+    finally:
+        document.close()
+
+    assert len(candidates) == 2
+    assert {candidate["rotation"] for candidate in candidates} == {0, 270}
+    assert all(
+        candidate["candidate_provider"] == "paddle-tiled-recall"
+        for candidate in candidates
+    )
+
+
+def test_tiled_paddle_recall_keeps_short_horizontal_header_labels(monkeypatch):
+    detection_calls = iter(
+        [
+            [
+                {
+                    "rect": fitz.Rect(20, 20, 60, 40),
+                    "source_confidence": 90.0,
+                },
+                {
+                    "rect": fitz.Rect(80, 100, 120, 120),
+                    "source_confidence": 90.0,
+                },
+            ],
+            [],
+        ]
+    )
+    monkeypatch.setattr(
+        visual_pdf,
+        "_dense_paddle_detection_seeds",
+        lambda _image: next(detection_calls),
+    )
+    document = fitz.open(stream=_blank_pdf(width=420, height=300), filetype="pdf")
+    try:
+        candidates = visual_pdf.detect_dense_cad_paddle_recall_candidates(
+            document[0],
+            desired_width=420,
+            native_units=[],
+        )
+    finally:
+        document.close()
+
+    assert [candidate["bbox"] for candidate in candidates] == [
+        pytest.approx((20, 20, 60, 40))
+    ]
+
+
+def test_tiled_paddle_recall_restores_short_rotated_header_labels(monkeypatch):
+    detection_calls = iter(
+        [
+            [],
+            [
+                {
+                    "rect": fitz.Rect(10, 160, 60, 180),
+                    "source_confidence": 94.0,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        visual_pdf,
+        "_dense_paddle_detection_seeds",
+        lambda _image: next(detection_calls),
+    )
+    document = fitz.open(stream=_blank_pdf(width=420, height=300), filetype="pdf")
+    try:
+        candidates = visual_pdf.detect_dense_cad_paddle_recall_candidates(
+            document[0],
+            desired_width=420,
+            native_units=[],
+        )
+    finally:
+        document.close()
+
+    assert len(candidates) == 1
+    assert candidates[0]["vertical"] is True
+    assert candidates[0]["rotation"] == 270
+    assert candidates[0]["bbox"] == pytest.approx(
+        (100, 33.75, 112.5, 65)
+    )
+
+
+def test_short_header_label_recall_uses_tight_ink_not_neighboring_rule():
+    image = np.full((500, 420, 3), 255, dtype=np.uint8)
+    # A short horizontal source label immediately above a vertical detector
+    # result. The long strokes are table rules and must not become candidates.
+    image[25:33, 160:167] = 0
+    image[25:33, 171:178] = 0
+    image[15:115, 150:151] = 0
+    image[15:115, 190:191] = 0
+    document = fitz.open(stream=_blank_pdf(width=420, height=500), filetype="pdf")
+    try:
+        candidates = visual_pdf._dense_header_short_label_candidates(
+            document[0],
+            image,
+            [
+                {
+                    "bbox": (160, 40, 180, 100),
+                    "rotation": 270,
+                    "vertical": True,
+                }
+            ],
+            header_height=120,
+        )
+    finally:
+        document.close()
+
+    assert len(candidates) == 1
+    assert candidates[0]["candidate_provider"] == "cad-short-label-recall"
+    assert candidates[0]["vertical"] is False
+    assert candidates[0]["bbox"] == pytest.approx((160, 25, 178, 33))
+
+
+def test_tiled_paddle_recall_filter_adds_only_lines_missing_from_full_ocr():
+    covered = [
+        {
+            "bbox": (20.0, 20.0, 130.0, 40.0),
+            "rotation": 0,
+        },
+        {
+            "bbox": (160.0, 10.0, 180.0, 110.0),
+            "rotation": 270,
+        },
+    ]
+    candidates = [
+        {
+            "bbox": (18.0, 19.0, 132.0, 41.0),
+            "rotation": 0,
+            "vertical": False,
+        },
+        {
+            "bbox": (160.0, 10.0, 180.0, 110.0),
+            "rotation": 0,
+            "vertical": False,
+        },
+        {
+            "bbox": (210.0, 60.0, 330.0, 80.0),
+            "rotation": 0,
+            "vertical": False,
+        },
+    ]
+
+    filtered = visual_pdf.filter_dense_cad_recall_candidates(
+        candidates,
+        covered_candidates=covered,
+    )
+
+    assert [candidate["bbox"] for candidate in filtered] == [
+        (210.0, 60.0, 330.0, 80.0),
+        (160.0, 10.0, 180.0, 110.0),
+    ]
+
+
+def test_tiled_recall_filter_preserves_exact_short_label_on_same_baseline():
+    covered = [{"bbox": (160.0, 40.0, 180.0, 100.0), "rotation": 270}]
+    exact_label = {
+        "bbox": (160.0, 20.0, 180.0, 36.0),
+        "rotation": 270,
+        "vertical": True,
+        "candidate_provider": "cad-short-label-recall",
+    }
+
+    filtered = visual_pdf.filter_dense_cad_recall_candidates(
+        [exact_label],
+        covered_candidates=covered,
+    )
+
+    assert filtered == [exact_label]
+
+
 def test_visual_ocr_keeps_complete_mixed_line_and_ignores_non_thai(monkeypatch):
     fake_ocr = _FakeOcr(
         {

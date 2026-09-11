@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import logging
+import multiprocessing
 import os
 import re
 import traceback
@@ -60,10 +61,12 @@ from .services.visual_pdf import (
     # Retained as an explicit diagnostic hook and for backwards-compatible
     # test instrumentation. Auto CAD routing no longer invokes it.
     detect_dense_cad_paddle_candidates,
+    detect_dense_cad_paddle_recall_candidates_in_worker,
     cad_paddle_worker_count,
     extract_visual_page_units,
     extract_visual_page_units_in_worker,
     filter_dense_cad_paddle_candidates,
+    filter_dense_cad_recall_candidates,
     initialize_pdf_ocr_worker,
     prepare_dense_cad_review_sheets,
     prepare_dense_cad_translation_sheets,
@@ -143,6 +146,9 @@ CAD_VISUAL_PAGE_CONCURRENCY = max(
     ),
 )
 CAD_PADDLE_WORKERS = cad_paddle_worker_count()
+CAD_TILED_RECALL_ENABLED = os.getenv(
+    "APP_CAD_TILED_RECALL_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 # This is a per-request guard, not a page-level service target. Gateway queue
 # time can exceed 30 seconds for a healthy high-detail image request, so allow
 # it to drain before invoking the bounded retry/review path. The provider's
@@ -1089,6 +1095,23 @@ async def _translate_pdf_document_pipeline(
     # reduce recall. Once no locator is waiting, configured production workers
     # may run independent Paddle models concurrently across pages.
     cad_local_ocr = _cad_local_ocr_coordinator_for_current_loop()
+    # Tiled geometry recall has its own spawned process. Paddle's CPU runtime
+    # serializes competing predictors inside one process despite idle host CPU,
+    # while sharing the full-OCR queue starves every recall page behind the
+    # entire document. One document-scoped process keeps a single warm detector,
+    # receives the PDF once through its initializer, and stays independent from
+    # both failure modes.
+    cad_recall_executor = (
+        ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=initialize_pdf_ocr_worker,
+            initargs=(content,),
+        )
+        if CAD_TILED_RECALL_ENABLED
+        else None
+    )
+    cad_recall_submit_semaphore = asyncio.Semaphore(1)
     # This limits concurrent visual-page workflows, not individual OCR calls.
     # Local CAD OCR has the stricter quality gate above, while this still lets
     # text batches and remote CAD sheets overlap across pages.
@@ -1100,6 +1123,12 @@ async def _translate_pdf_document_pipeline(
     # expensive render no longer creates a serial gap after detection. The
     # resolution and the downstream crops remain unchanged.
     cad_review_render_semaphore = asyncio.Semaphore(1)
+    # PNG crop packing is OpenCV-heavy and can fan out hundreds of resize and
+    # encode operations per page. Multiple CAD pages doing that concurrently
+    # caused severe CPU oversubscription and multi-minute stalls without adding
+    # any useful parallelism. Keep the exact same pixels and sheet layout, but
+    # prepare one page's review sheets at a time.
+    cad_review_prepare_semaphore = asyncio.Semaphore(1)
     # These caches live for one uploaded document only. Reuse therefore cannot
     # leak terminology or OCR decisions between customers. Vision reuse also
     # requires a matching glyph fingerprint and local Thai OCR hint.
@@ -1245,10 +1274,13 @@ async def _translate_pdf_document_pipeline(
                 )
             page_rotation = int(page_profile.get("page_rotation") or 0) % 360
             cad_ocr_mode = os.getenv("APP_CAD_OCR_MODE", "auto").strip().lower()
-            # Tesseract is the default locator for every CAD page. It is fast,
-            # local and filters directly to Thai candidates. Paddle's full-page
-            # detector is retained only as an explicit diagnostic mode: it is
-            # expensive and rediscovered editable native text on these pages.
+            # Default CAD recall is supplemented by a high-resolution tiled
+            # detector in an isolated process. Keep the existing Tesseract
+            # primary during this rollout so a detector/process failure cannot
+            # reduce the previous candidate set; the new path only adds boxes.
+            tiled_recall_enabled = (
+                CAD_TILED_RECALL_ENABLED and cad_ocr_mode == "auto"
+            )
             cad_detection_provider = (
                 "paddle-detector" if cad_ocr_mode == "paddle" else "tesseract"
             )
@@ -1364,9 +1396,57 @@ async def _translate_pdf_document_pipeline(
                         )
                         return candidates
 
+                async def locate_raw_paddle_recall_candidates_once():
+                    queue_started_at = monotonic()
+                    async with cad_recall_submit_semaphore:
+                        worker_started_at = monotonic()
+                        _log_document_event(
+                            "cad_paddle_recall_worker_started",
+                            filename=filename,
+                            page_number=page_number,
+                            queue_ms=round(
+                                (worker_started_at - queue_started_at) * 1000
+                            ),
+                        )
+                        if cad_recall_executor is None:
+                            return []
+                        try:
+                            candidates = await loop.run_in_executor(
+                                cad_recall_executor,
+                                detect_dense_cad_paddle_recall_candidates_in_worker,
+                                page_number,
+                                native_units,
+                                4800,
+                            )
+                        except Exception as exc:
+                            _log_document_event(
+                                "cad_paddle_recall_worker_failed",
+                                filename=filename,
+                                page_number=page_number,
+                                error_type=type(exc).__name__,
+                            )
+                            return []
+                        _log_document_event(
+                            "cad_paddle_recall_worker_completed",
+                            filename=filename,
+                            page_number=page_number,
+                            candidate_count=len(candidates),
+                            inference_ms=round(
+                                (monotonic() - worker_started_at) * 1000
+                            ),
+                        )
+                        return candidates
+
                 paddle_supplement_started_at = monotonic()
                 paddle_supplement_task = asyncio.create_task(
                     locate_raw_paddle_candidates_once()
+                )
+                paddle_recall_task = (
+                    asyncio.create_task(
+                        locate_raw_paddle_recall_candidates_once()
+                    )
+                    if tiled_recall_enabled
+                    else None
                 )
                 # Rendering used to begin only after Paddle finished. Start it
                 # now and let the single render lane fill otherwise-idle CPU
@@ -1375,6 +1455,8 @@ async def _translate_pdf_document_pipeline(
                 await asyncio.sleep(0)
 
                 def prepare_sheets():
+                    if cad_detection_provider == "none":
+                        return []
                     document = fitz.open(stream=content, filetype="pdf")
                     try:
                         return prepare_dense_cad_translation_sheets(
@@ -1395,8 +1477,18 @@ async def _translate_pdf_document_pipeline(
                         sheets = await loop.run_in_executor(None, prepare_sheets)
                 except BaseException:
                     paddle_supplement_task.cancel()
+                    if paddle_recall_task:
+                        paddle_recall_task.cancel()
                     await asyncio.gather(
-                        paddle_supplement_task, return_exceptions=True
+                        *(
+                            task
+                            for task in (
+                                paddle_supplement_task,
+                                paddle_recall_task,
+                            )
+                            if task is not None
+                        ),
+                        return_exceptions=True,
                     )
                     raise
                 indexed_entries = [
@@ -2013,9 +2105,10 @@ async def _translate_pdf_document_pipeline(
                         finally:
                             document.close()
 
-                    unresolved_sheets = await loop.run_in_executor(
-                        None, prepare_unresolved_review_sheets
-                    )
+                    async with cad_review_prepare_semaphore:
+                        unresolved_sheets = await loop.run_in_executor(
+                            None, prepare_unresolved_review_sheets
+                        )
                     _log_document_event(
                         "cad_review_sheets_prepare_completed",
                         filename=filename,
@@ -2122,6 +2215,9 @@ async def _translate_pdf_document_pipeline(
                     )
                 paddle_wait_started_at = monotonic()
                 raw_paddle_candidates = await paddle_supplement_task
+                raw_paddle_recall_candidates = (
+                    await paddle_recall_task if paddle_recall_task else []
+                )
                 _log_document_event(
                     "cad_paddle_supplement_completed",
                     filename=filename,
@@ -2139,6 +2235,23 @@ async def _translate_pdf_document_pipeline(
                     existing_bboxes=existing_bboxes,
                     page_rotation=page_rotation,
                     include_existing_matches=True,
+                )
+                recall_coverage_candidates = [
+                    dict(entry)
+                    for entry in indexed_entries
+                    if entry.get("bbox")
+                ]
+                recall_coverage_candidates.extend(raw_paddle_candidates)
+                paddle_recall_candidates = filter_dense_cad_recall_candidates(
+                    raw_paddle_recall_candidates,
+                    covered_candidates=recall_coverage_candidates,
+                )
+                _log_document_event(
+                    "cad_paddle_recall_supplement_completed",
+                    filename=filename,
+                    page_number=page_number,
+                    raw_candidate_count=len(raw_paddle_recall_candidates),
+                    added_candidate_count=len(paddle_recall_candidates),
                 )
                 paddle_only_candidates = []
                 paddle_replacement_candidate_count = 0
@@ -2159,6 +2272,7 @@ async def _translate_pdf_document_pipeline(
                     candidate["cover_bbox"] = tuple(candidate["bbox"])
                     paddle_only_candidates.append(candidate)
                     paddle_replacement_candidate_count += 1
+                paddle_only_candidates.extend(paddle_recall_candidates)
 
                 if paddle_only_candidates:
                     review_page_png = await get_review_page_png()
@@ -2184,9 +2298,10 @@ async def _translate_pdf_document_pipeline(
                         finally:
                             document.close()
 
-                    paddle_sheets = await loop.run_in_executor(
-                        None, prepare_paddle_review_sheets
-                    )
+                    async with cad_review_prepare_semaphore:
+                        paddle_sheets = await loop.run_in_executor(
+                            None, prepare_paddle_review_sheets
+                        )
                     _log_document_event(
                         "cad_review_sheets_prepare_completed",
                         filename=filename,
@@ -2239,11 +2354,12 @@ async def _translate_pdf_document_pipeline(
                     ]
                     paddle_group_results = await asyncio.gather(
                         *(
-                            read_indexed_sheet_group(
-                                group_number,
-                                group,
-                                require_complete=True,
-                            )
+                        read_indexed_sheet_group(
+                            group_number,
+                            group,
+                            require_complete=True,
+                            stage="CAD Paddle 补漏",
+                        )
                             for group_number, group in enumerate(
                                 paddle_groups, start=1
                             )
@@ -4030,6 +4146,9 @@ async def _translate_pdf_document_pipeline(
 
         ocr_page_results = []
         ocr_task_results = await asyncio.gather(*ocr_tasks)
+        if cad_recall_executor is not None:
+            cad_recall_executor.shutdown(wait=True)
+            cad_recall_executor = None
         if deep_ocr_executor is not None:
             deep_ocr_executor.shutdown(wait=True)
             deep_ocr_executor = None
@@ -4063,6 +4182,8 @@ async def _translate_pdf_document_pipeline(
         await producer
         raise
     finally:
+        if cad_recall_executor is not None:
+            cad_recall_executor.shutdown(wait=True)
         if deep_ocr_executor is not None:
             deep_ocr_executor.shutdown(wait=True)
 

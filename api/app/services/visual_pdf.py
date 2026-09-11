@@ -135,6 +135,10 @@ _CAD_TESSERACT_SEMAPHORE = threading.BoundedSemaphore(_CAD_TESSERACT_WORKERS)
 # Overlapping tiles retain that glyph detail while remaining model-agnostic.
 _CAD_DETECTION_TILE_SIDE = 1600
 _CAD_DETECTION_TILE_OVERLAP = 256
+_CAD_RECALL_MIN_ASPECT_RATIO = max(
+    2.0,
+    min(6.0, float(os.getenv("APP_CAD_RECALL_MIN_ASPECT_RATIO", "3.0"))),
+)
 _LETTER_PATTERN = re.compile(r"[A-Za-z\u0E00-\u0E7F\u4E00-\u9FFF]")
 _CJK_PATTERN = re.compile(r"[\u4E00-\u9FFF]")
 _THAI_LATIN_PATTERN = re.compile(r"[A-Za-z\u0E00-\u0E7F]")
@@ -1672,6 +1676,414 @@ def detect_dense_cad_paddle_candidates(
         existing_bboxes=existing_bboxes,
         page_rotation=page_rotation,
     )
+
+
+def detect_dense_cad_paddle_recall_candidates(
+    page,
+    *,
+    desired_width: int = 4800,
+    native_units: Optional[Sequence[Dict[str, Any]]] = None,
+    minimum_aspect_ratio: float = _CAD_RECALL_MIN_ASPECT_RATIO,
+) -> List[Dict[str, Any]]:
+    """Locate long vertical and small dense CAD text at source resolution.
+
+    The normal full-page OCR pass is intentionally capped before inference and
+    can therefore miss tiny schedule notes or every vertical header on a large
+    drawing.  The geometry-only detector already used by the diagnostic CAD
+    route works on overlapping 1600px tiles, so it retains that detail without
+    trusting a second OCR transcription.  Restricting the result to elongated
+    text-line shapes removes the many square table cells and symbols; GPT still
+    reads every surviving crop before any source pixels are covered.
+    """
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("PaddleOCR 运行环境不完整") from exc
+
+    scale = min(
+        2.0,
+        max(1.0, desired_width / max(1.0, page.rect.width)),
+    )
+    image = _render_page_bgr_image(page, scale)
+    if image is None:
+        raise RuntimeError("PDF 页面无法转换为 CAD 补漏检测图")
+
+    native_rects = [
+        fitz.Rect(unit["bbox"])
+        for unit in native_units or []
+        if isinstance(unit.get("bbox"), (list, tuple)) and len(unit["bbox"]) == 4
+    ]
+    image_height, image_width = image.shape[:2]
+    page_rotation = int(page.rotation) % 360
+    vertical_rotation = _display_direction_to_unrotated_rotation(
+        page, (0.0, -1.0)
+    )
+    seeds = [
+        (seed, False)
+        for seed in _dense_paddle_detection_seeds(image)
+    ]
+    # Paddle's detector is strongest on horizontal text. Dense schedule pages
+    # commonly put short labels vertically in the top header band, where the
+    # normal pass finds only the longest rows. Rotate that generic band once,
+    # detect at the same source resolution, then map only genuinely vertical
+    # boxes back to the page. This is a layout rule, not a page/template rule.
+    header_height = max(1, int(image_height * 0.24))
+    header_detection_scale = 1.6
+    enlarged_header = cv2.resize(
+        image[:header_height],
+        None,
+        fx=header_detection_scale,
+        fy=header_detection_scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    rotated_header = cv2.rotate(
+        enlarged_header,
+        cv2.ROTATE_90_CLOCKWISE,
+    )
+    for seed in _dense_paddle_detection_seeds(rotated_header):
+        rotated_rect = fitz.Rect(seed["rect"])
+        restored_polygon = _restore_clockwise_polygon(
+            [
+                [rotated_rect.x0, rotated_rect.y0],
+                [rotated_rect.x1, rotated_rect.y0],
+                [rotated_rect.x1, rotated_rect.y1],
+                [rotated_rect.x0, rotated_rect.y1],
+            ],
+            enlarged_header.shape[0],
+        )
+        restored_rect = fitz.Rect(
+            _polygon_rect(restored_polygon)
+        ) / header_detection_scale
+        if (
+            restored_rect.is_empty
+            or restored_rect.height <= restored_rect.width * 1.5
+        ):
+            continue
+        restored_seed = dict(seed)
+        restored_seed["rect"] = restored_rect
+        seeds.append((restored_seed, True))
+
+    candidates = []
+    for seed, forced_vertical in seeds:
+        pixel_rect = fitz.Rect(seed["rect"])
+        if pixel_rect.is_empty:
+            continue
+        short_side = min(pixel_rect.width, pixel_rect.height)
+        long_side = max(pixel_rect.width, pixel_rect.height)
+        in_header_band = pixel_rect.y0 < header_height and pixel_rect.y1 <= (
+            header_height * 1.02
+        )
+        required_aspect_ratio = (
+            1.5
+            if forced_vertical or in_header_band
+            else minimum_aspect_ratio
+        )
+        if short_side <= 0 or long_side / short_side < required_aspect_ratio:
+            continue
+        polygon = [
+            [pixel_rect.x0, pixel_rect.y0],
+            [pixel_rect.x1, pixel_rect.y0],
+            [pixel_rect.x1, pixel_rect.y1],
+            [pixel_rect.x0, pixel_rect.y1],
+        ]
+        page_rect = _ocr_polygon_to_unrotated_rect(
+            page, polygon, image_width, image_height
+        )
+        if page_rect.is_empty or max(page_rect.width, page_rect.height) < 7.0:
+            continue
+        if any(
+            _overlap_smaller(page_rect, native_rect) >= 0.55
+            for native_rect in native_rects
+        ):
+            continue
+        vertical = forced_vertical or pixel_rect.height > pixel_rect.width
+        candidates.append(
+            {
+                "bbox": tuple(page_rect),
+                "rotation": vertical_rotation if vertical else page_rotation,
+                "vertical": vertical,
+                "source_hint": "",
+                "source_confidence": float(
+                    seed.get("source_confidence") or 0.0
+                ),
+                "candidate_provider": "paddle-tiled-recall",
+            }
+        )
+    candidates = _deduplicate_page_candidates(candidates)
+    # Keep real detector boxes first. A short label deliberately shares the
+    # same text baseline as its longer neighbor, so the general line deduper
+    # would otherwise discard the exact morphology box as a duplicate.
+    return [
+        *candidates,
+        *_dense_header_short_label_candidates(
+            page,
+            image,
+            candidates,
+            header_height=header_height,
+        ),
+    ]
+
+
+def _dense_header_short_label_candidates(
+    page,
+    image,
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    header_height: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Locate exact short labels immediately before vertical CAD headers.
+
+    Dense bilingual schedules often put a tiny Thai word above a longer
+    vertical English label. Depending on the authoring tool, that Thai word can
+    itself be horizontal or vertical. Paddle reliably finds the long label but
+    may omit the tiny one. Removing long table rules and joining nearby ink in
+    both directions provides a tight *real-pixel* proposal; GPT still has to
+    confirm source-language text before the proposal can be covered.
+    """
+    import cv2
+    import numpy as np
+
+    image_height, image_width = image.shape[:2]
+    header_height = max(
+        1,
+        min(
+            image_height,
+            int(header_height or image_height * 0.24),
+        ),
+    )
+    gray = cv2.cvtColor(image[:header_height], cv2.COLOR_BGR2GRAY)
+    ink = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )[1]
+    unit_scale = max(0.75, image_width / 4000.0)
+    rule_length = max(40, round(80 * unit_scale))
+    horizontal_rules = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (rule_length, 1)),
+    )
+    vertical_rules = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, rule_length)),
+    )
+    compact_ink = cv2.bitwise_and(
+        ink,
+        cv2.bitwise_not(cv2.bitwise_or(horizontal_rules, vertical_rules)),
+    )
+
+    display_scale_x = image_width / max(1.0, page.rect.width)
+    display_scale_y = image_height / max(1.0, page.rect.height)
+    existing = []
+    vertical_neighbors = []
+    for candidate in candidates:
+        display_rect = fitz.Rect(candidate["bbox"]) * page.rotation_matrix
+        pixel_rect = fitz.Rect(
+            display_rect.x0 * display_scale_x,
+            display_rect.y0 * display_scale_y,
+            display_rect.x1 * display_scale_x,
+            display_rect.y1 * display_scale_y,
+        )
+        existing.append((candidate, pixel_rect))
+        if candidate.get("vertical"):
+            vertical_neighbors.append(pixel_rect)
+    if not vertical_neighbors:
+        return []
+
+    proposals = []
+    joining_kernels = (
+        (
+            False,
+            (
+                max(7, round(13 * unit_scale)),
+                max(2, round(3 * unit_scale)),
+            ),
+        ),
+        (
+            True,
+            (
+                max(2, round(3 * unit_scale)),
+                max(7, round(13 * unit_scale)),
+            ),
+        ),
+    )
+    for vertical, kernel_size in joining_kernels:
+        joined = cv2.dilate(
+            compact_ink,
+            cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size),
+        )
+        contours, _hierarchy = cv2.findContours(
+            joined,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            if not (
+                5 * unit_scale <= width <= 240 * unit_scale
+                and 5 * unit_scale <= height <= 80 * unit_scale
+            ):
+                continue
+            aspect_ratio = (
+                height / max(1.0, width)
+                if vertical
+                else width / max(1.0, height)
+            )
+            if aspect_ratio < 1.1:
+                continue
+            source_crop = compact_ink[y : y + height, x : x + width]
+            ink_y, ink_x = np.where(source_crop > 0)
+            if len(ink_x) < max(12, round(12 * unit_scale)):
+                continue
+            pixel_rect = fitz.Rect(
+                x + int(ink_x.min()),
+                y + int(ink_y.min()),
+                x + int(ink_x.max()) + 1,
+                y + int(ink_y.max()) + 1,
+            )
+            if max(pixel_rect.width, pixel_rect.height) > 45 * unit_scale:
+                continue
+            rotation = (
+                _display_direction_to_unrotated_rotation(page, (0.0, -1.0))
+                if vertical
+                else int(page.rotation) % 360
+            )
+            if any(
+                int(candidate.get("rotation") or 0) % 360 == rotation
+                and _overlap_smaller(pixel_rect, existing_rect) >= 0.35
+                for candidate, existing_rect in existing
+            ):
+                continue
+            adjacent = False
+            for neighbor in vertical_neighbors:
+                gap = neighbor.y0 - pixel_rect.y1
+                if gap < -3 * unit_scale or gap > 48 * unit_scale:
+                    continue
+                x_overlap = max(
+                    0.0,
+                    min(pixel_rect.x1, neighbor.x1)
+                    - max(pixel_rect.x0, neighbor.x0),
+                )
+                aligned = (
+                    x_overlap / max(1.0, min(pixel_rect.width, neighbor.width))
+                    >= 0.20
+                    or pixel_rect.x0 - 8 * unit_scale
+                    <= (neighbor.x0 + neighbor.x1) / 2
+                    <= pixel_rect.x1 + 8 * unit_scale
+                )
+                if aligned:
+                    adjacent = True
+                    break
+            if not adjacent:
+                continue
+            polygon = [
+                [pixel_rect.x0, pixel_rect.y0],
+                [pixel_rect.x1, pixel_rect.y0],
+                [pixel_rect.x1, pixel_rect.y1],
+                [pixel_rect.x0, pixel_rect.y1],
+            ]
+            page_rect = _ocr_polygon_to_unrotated_rect(
+                page,
+                polygon,
+                image_width,
+                image_height,
+            )
+            if page_rect.is_empty:
+                continue
+            proposals.append(
+                (
+                    pixel_rect,
+                    {
+                        "bbox": tuple(page_rect),
+                        "rotation": rotation,
+                        "vertical": vertical,
+                        "source_hint": "",
+                        "source_confidence": 0.0,
+                        "candidate_provider": "cad-short-label-recall",
+                    },
+                    aspect_ratio,
+                )
+            )
+    selected = []
+    for pixel_rect, candidate, _aspect_ratio in sorted(
+        proposals,
+        key=lambda item: item[2],
+        reverse=True,
+    ):
+        if any(
+            _overlap_smaller(pixel_rect, prior_rect) >= 0.55
+            for prior_rect, _prior_candidate in selected
+        ):
+            continue
+        selected.append((pixel_rect, candidate))
+    return [candidate for _pixel_rect, candidate in selected]
+
+
+def detect_dense_cad_paddle_recall_candidates_in_worker(
+    page_number: int,
+    native_units: Optional[Sequence[Dict[str, Any]]] = None,
+    desired_width: int = 4800,
+) -> List[Dict[str, Any]]:
+    """Run tiled CAD recall in its isolated, document-scoped process."""
+    if _OCR_WORKER_PDF_CONTENT is None:
+        raise RuntimeError("CAD 补漏子进程尚未初始化 PDF")
+    document = fitz.open(stream=_OCR_WORKER_PDF_CONTENT, filetype="pdf")
+    try:
+        return detect_dense_cad_paddle_recall_candidates(
+            document[page_number - 1],
+            desired_width=desired_width,
+            native_units=native_units,
+        )
+    finally:
+        document.close()
+
+
+def filter_dense_cad_recall_candidates(
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    covered_candidates: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Keep only tiled-recall boxes that add meaningful source coverage."""
+    covered = [dict(candidate) for candidate in covered_candidates or []]
+    output = []
+    for original in candidates:
+        candidate = dict(original)
+        rect = fitz.Rect(candidate["bbox"])
+        rotation = int(candidate.get("rotation") or 0) % 360
+        exact_short_label = (
+            candidate.get("candidate_provider") == "cad-short-label-recall"
+        )
+        matching = next(
+            (
+                existing
+                for existing in covered
+                if int(existing.get("rotation") or 0) % 360 == rotation
+                and (
+                    (
+                        not exact_short_label
+                        and _same_ocr_line(
+                            rect,
+                            fitz.Rect(existing["bbox"]),
+                            rotation,
+                        )
+                    )
+                    or _overlap_smaller(rect, fitz.Rect(existing["bbox"])) >= 0.50
+                )
+            ),
+            None,
+        )
+        if matching is not None:
+            # Full OCR is authoritative for a line it already recognized. The
+            # tiled detector is a recall alarm, not a competing cover-box
+            # estimator; keeping both would translate and cover the same line
+            # twice when their rectangles differ by only a few pixels.
+            continue
+        output.append(candidate)
+        covered.append(candidate)
+    return _deduplicate_page_candidates(output)
 
 
 def _detect_dense_cad_paddle_candidates_selective(

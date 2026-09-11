@@ -21,6 +21,7 @@ from openpyxl import load_workbook
 TEST_DATABASE = Path("/tmp/siamlink-test.db")
 os.environ["AI_PROVIDER"] = "demo"
 os.environ["APP_DATABASE_PATH"] = str(TEST_DATABASE)
+os.environ["APP_CAD_TILED_RECALL_ENABLED"] = "false"
 
 from fastapi.testclient import TestClient
 
